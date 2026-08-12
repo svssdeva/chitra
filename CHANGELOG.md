@@ -23,8 +23,10 @@ All notable changes to this project are documented here. The format follows
   changed symbols by risk.
 - **Structure commands.** `communities`, `community`, `architecture`, `flows`,
   and `flow`.
-- **MCP server.** `chitra serve` speaks JSON-RPC 2.0 over stdio with six tiered
-  tools, per-response token estimates, and a `--tools` allowlist.
+- **MCP server.** `chitra serve` speaks JSON-RPC 2.0 over stdio with seven tiered
+  tools, per-response token estimates, and a `--tools` allowlist. `search` is the
+  entry point: every other tool takes an exact symbol id, and this is the one
+  that produces one from words.
 - **Agent registration.** `chitra install` writes MCP entries for Claude Code,
   Codex, Cursor, Antigravity, Windsurf, VS Code/Copilot, and Claude Desktop,
   leaving other servers in those files untouched. `--dry-run` shows the diff.

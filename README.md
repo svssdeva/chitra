@@ -73,10 +73,10 @@ machine — Claude Code, Codex, Cursor, Antigravity, Windsurf, VS Code/Copilot,
 Claude Desktop. Existing servers in those config files are left alone; `--dry-run`
 shows you exactly what would change.
 
-Your assistant then gets six tools, including `get_minimal_context` (orient in a
-new repository), `detect_changes` (review a diff by risk), and `impact` (blast
-radius). Every response is stamped with a token estimate so the assistant can
-budget before it spends.
+Your assistant then gets seven tools: `search` (find a symbol from words),
+`get_minimal_context` (orient in a new repository), `detect_changes` (review a
+diff by risk), `impact` (blast radius), and three more. Every response is
+stamped with a token estimate so the assistant can budget before it spends.
 
 See **[docs/agents.md](docs/agents.md)**.
 

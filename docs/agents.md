@@ -62,16 +62,27 @@ you do not control.
 
 ## Tools
 
-JSON-RPC 2.0 over stdio, protocol version `2024-11-05`. Six tools:
+JSON-RPC 2.0 over stdio, protocol version `2024-11-05`. Seven tools:
 
 | Tool | Use it for |
 |---|---|
 | `get_minimal_context` | The smallest useful orientation for a repository. Around 250 tokens. |
+| `search` | Finding symbols from words. **Start here** when you don't already know an exact symbol. |
 | `get_review_context` | Everything needed to review one symbol: neighbourhood, risk, tests. Takes `detail_level`. |
 | `detect_changes` | Diff against a base ref, ranked by risk. |
 | `impact` | Transitive dependents of a symbol, bounded by depth. |
 | `query_graph` | One tool, six patterns: `callers_of`, `callees_of`, `tests_for`, `impact_of`, `community_of`, `file_summary`. |
 | `architecture` | Module-level overview. |
+
+`search` matters more than its size suggests. Every other tool takes an exact
+`file.rs::Symbol` id, so an assistant holding only a description — "where do we
+handle sign-in?" — has no way in without it. It returns qualified names, which
+are exactly what the other tools want.
+
+It searches **names and signatures**, never function bodies or comments. On an
+`embeddings` build it uses the same hybrid channels as `chitra search --hybrid`
+and reports `"mode": "hybrid"`; otherwise `"mode": "fts"`. Either way, it finds
+what your code *names*, so it works best when your naming is honest.
 
 Every response carries `_meta.token_estimate` — a cl100k estimate, labelled as
 an estimate, so an assistant can budget before it spends.

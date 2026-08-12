@@ -17,7 +17,7 @@ path = "src/main.rs"
 [features]
 default = []
 deep-resolve = ["chitra-core/deep-resolve"]
-embeddings = ["chitra-core/embeddings"]
+embeddings = ["chitra-core/embeddings", "chitra-mcp/embeddings"]
 dynamic-grammars = ["chitra-core/dynamic-grammars"]
 
 [dependencies]

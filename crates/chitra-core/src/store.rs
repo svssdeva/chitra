@@ -88,6 +88,12 @@ pub struct EdgeRow {
     pub tier: String,
 }
 
+/// Wrap a query as a single FTS5 phrase, so none of its characters are read as
+/// operators. Embedded quotes are doubled, which is FTS5's own escape.
+fn fts_phrase(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
 /// A detected execution flow (entry point + reachable set).
 #[derive(Debug, Clone)]
 pub struct FlowRow {
@@ -571,7 +577,20 @@ impl Store {
     }
 
     /// FTS search: qualified_names of matching nodes, ranked.
+    ///
+    /// FTS5 has its own query grammar, in which `(`, `"`, `*`, `:` and `-` are
+    /// operators. A query typed by a human — or handed over by an assistant —
+    /// routinely contains them (`get_config()`, `foo-bar`), and MATCH answers
+    /// with a syntax *error* rather than an empty result. Retrying the whole
+    /// string as a quoted phrase turns that failure into an ordinary search.
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<String>> {
+        match self.fts_match(query, limit) {
+            Ok(hits) => Ok(hits),
+            Err(_) => self.fts_match(&fts_phrase(query), limit),
+        }
+    }
+
+    fn fts_match(&self, query: &str, limit: i64) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT qualified_name FROM nodes_fts WHERE nodes_fts MATCH ?1
              ORDER BY rank LIMIT ?2",
@@ -726,6 +745,14 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
+    /// Indexed source files. Distinct from `node_count` — one file holds many
+    /// symbols, so reporting nodes as files overstates a repo's size several
+    /// times over.
+    pub fn file_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))?)
+    }
     pub fn node_count(&self) -> Result<i64> {
         Ok(self
             .conn

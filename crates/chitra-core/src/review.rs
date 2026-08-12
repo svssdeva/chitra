@@ -262,12 +262,15 @@ pub fn minimal_context(store: &Store) -> Result<Value> {
         .collect::<Vec<_>>();
     Ok(json!({
         "stats": {
-            "files": store.node_count()?, // node count is the useful scale signal
+            "files": store.file_count()?,
             "nodes": store.node_count()?,
             "edges": store.edge_count()?,
         },
         "top_risks": top,
+        // `search` leads: every other tool takes an exact `file::Symbol`, so an
+        // assistant that does not already know the name has to start here.
         "next_tool_suggestions": [
+            "search(query) — find symbols by name or signature; start here to get an exact symbol",
             "detect_changes(base) — risk of a diff",
             "get_review_context(symbol) — bounded context for one symbol",
             "query_graph(pattern, symbol) — callers_of/callees_of/tests_for/impact_of",

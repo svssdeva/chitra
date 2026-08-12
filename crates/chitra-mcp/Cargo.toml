@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Lets the `search` tool use the same hybrid channels as `chitra search
+# --hybrid`; without it the tool still works, over FTS alone.
+embeddings = ["chitra-core/embeddings"]
+
 [dependencies]
 chitra-core = { path = "../chitra-core" }
 serde_json.workspace = true

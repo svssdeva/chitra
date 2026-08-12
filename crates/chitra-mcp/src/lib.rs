@@ -146,6 +146,20 @@ fn dispatch(name: &str, args: &Value, store: &Store, root: &Path) -> Result<Valu
                 "nodes": nodes,
             }))
         }
+        // Every other tool needs an exact `file::Symbol`. This is the one that
+        // produces one, so it is the entry point for an assistant that only has
+        // words to go on.
+        "search" => {
+            let q = args.get("query").and_then(|s| s.as_str()).unwrap_or("");
+            let limit = args.get("limit").and_then(|l| l.as_i64()).unwrap_or(20);
+            let (results, mode) = search_symbols(store, q, limit)?;
+            Ok(json!({
+                "query": q,
+                "mode": mode,
+                "count": results.len(),
+                "symbols": results,
+            }))
+        }
         "query_graph" => {
             let pattern = args.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
             let out = match pattern {
@@ -175,6 +189,24 @@ fn dispatch(name: &str, args: &Value, store: &Store, root: &Path) -> Result<Valu
             Ok(out)
         }
         other => anyhow::bail!("unknown tool: {other}"),
+    }
+}
+
+/// FTS by default. An `embeddings` build additionally fuses lexical trigrams
+/// and graph context, exactly as `chitra search --hybrid` does — otherwise the
+/// CLI would have a retrieval channel the assistant could not reach. The mode
+/// is reported back so a caller knows which one answered.
+fn search_symbols(store: &Store, q: &str, limit: i64) -> Result<(Vec<String>, &'static str)> {
+    #[cfg(feature = "embeddings")]
+    {
+        Ok((
+            chitra_core::hybrid_search(store, q, limit as usize)?,
+            "hybrid",
+        ))
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        Ok((store.search(q, limit)?, "fts"))
     }
 }
 
@@ -211,6 +243,15 @@ fn tool_specs(allow: Option<&[String]>) -> Vec<Value> {
                     "depth": { "type": "integer" },
                     "direction": { "type": "string", "enum": ["reverse", "forward"] }
                 }, "required": ["symbol"] }
+        }),
+        json!({
+            "name": "search",
+            "description": "Find symbols by name or signature. Use this first when you have words rather than an exact symbol — every other tool needs a `file::Symbol` id, and this is what produces one.",
+            "inputSchema": { "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "words to match against symbol names and signatures" },
+                    "limit": { "type": "integer", "description": "max results, default 20" }
+                }, "required": ["query"] }
         }),
         json!({
             "name": "query_graph",
@@ -275,6 +316,49 @@ mod tests {
         assert_eq!(r["result"]["serverInfo"]["name"], "chitra");
     }
 
+    /// The gap this tool closes: every other tool needs an exact
+    /// `file::Symbol`, so without search an assistant holding only words has no
+    /// way in.
+    #[test]
+    fn search_finds_a_symbol_from_words_alone() {
+        let (store, dir) = store_with_fixture("search_finds_a_sym");
+        let r = handle(
+            &req(
+                1,
+                "tools/call",
+                json!({ "name": "search", "arguments": { "query": "helper" } }),
+            ),
+            &store,
+            &dir,
+            None,
+        )
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let out: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(out["symbols"][0], "m.rs::helper");
+        assert!(out["_meta"]["token_estimate"].as_u64().unwrap() > 0);
+    }
+
+    /// FTS5 reads `(` and `)` as operators, so an unguarded MATCH answers a
+    /// query like this with a syntax error instead of results.
+    #[test]
+    fn search_survives_fts_operator_characters() {
+        let (store, _dir) = store_with_fixture("search_survives_fts");
+        assert!(
+            store.search("helper()", 10).is_ok(),
+            "a query containing FTS5 operators must not error"
+        );
+    }
+
+    #[test]
+    fn minimal_context_counts_files_not_nodes() {
+        let (store, _dir) = store_with_fixture("minimal_ctx_files");
+        let ctx = chitra_core::minimal_context(&store).unwrap();
+        // One fixture file holding two functions.
+        assert_eq!(ctx["stats"]["files"], 1);
+        assert_eq!(ctx["stats"]["nodes"], 2);
+    }
+
     #[test]
     fn notifications_get_no_response() {
         let (store, dir) = store_with_fixture("notifications_get_no");
@@ -286,7 +370,26 @@ mod tests {
     fn tools_list_and_allowlist() {
         let (store, dir) = store_with_fixture("tools_list_and_allow");
         let all = handle(&req(2, "tools/list", json!({})), &store, &dir, None).unwrap();
-        assert_eq!(all["result"]["tools"].as_array().unwrap().len(), 6);
+        let names: Vec<&str> = all["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        // Named rather than counted: a bare count says nothing about which tool
+        // went missing, and the surface is what an assistant actually sees.
+        assert_eq!(
+            names,
+            vec![
+                "get_minimal_context",
+                "get_review_context",
+                "detect_changes",
+                "impact",
+                "search",
+                "query_graph",
+                "architecture",
+            ]
+        );
 
         let allow = vec!["impact".to_string()];
         let one = handle(&req(3, "tools/list", json!({})), &store, &dir, Some(&allow)).unwrap();
