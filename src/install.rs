@@ -376,9 +376,25 @@ mod tests {
     /// Windows canonicalisation returns an extended-length path. It must
     /// not leak into a config an agent has to launch the server from.
     #[test]
+    #[cfg(windows)]
     fn verbatim_windows_prefix_is_stripped() {
         let verbatim = String::from("\\\\?\\C:\\repo\\src");
         assert_eq!(plain(Path::new(&verbatim)), "C:/repo/src");
+    }
+
+    /// A backslash is a legal character in a Unix filename, so `plain` must
+    /// hand the path back untouched there — rewriting separators would turn
+    /// one file into a fake directory chain.
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_paths_are_never_rewritten() {
+        assert_eq!(plain(Path::new("/home/u/repo")), "/home/u/repo");
+        assert_eq!(plain(Path::new(r"/home/u/we\ird")), r"/home/u/we\ird");
+    }
+
+    /// True on every platform: an ordinary POSIX path survives unchanged.
+    #[test]
+    fn a_plain_posix_path_is_unchanged() {
         assert_eq!(plain(Path::new("/home/u/repo")), "/home/u/repo");
     }
     #[test]
