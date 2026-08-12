@@ -1,0 +1,94 @@
+name: "chitra review"
+description: "Graph the repo, detect change risk vs the PR base, and post a sticky review comment."
+author: "chitra"
+branding:
+  icon: git-pull-request
+  color: purple
+
+inputs:
+  base:
+    description: "Git base ref to diff against."
+    default: "origin/${{ github.base_ref }}"
+  limit:
+    description: "Max changed symbols to show (ranked by risk)."
+    default: "20"
+  fail-on-risk:
+    description: "Fail the job if any high-risk (>=0.70) symbol changed."
+    default: "false"
+  db:
+    description: "Graph database path (cached between runs)."
+    default: ".chitra/graph.db"
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+
+    # Restore the graph db across runs. The key tracks the resolved action ref,
+    # so pinning a new chitra version forces a clean rebuild rather than
+    # reusing a database written by a different schema.
+    - name: Restore graph cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.db }}
+        key: chitra-graph-${{ github.action_ref || 'local' }}
+
+    # The action's own source lives at github.action_path, NOT in the caller's
+    # checkout — every path below is anchored there, and the binary is exported
+    # so later steps do not have to repeat it.
+    - name: Build chitra
+      shell: bash
+      run: |
+        cargo build --release --locked --manifest-path "${{ github.action_path }}/Cargo.toml"
+        echo "CHITRA_BIN=${{ github.action_path }}/target/release/chitra" >> "$GITHUB_ENV"
+
+    # Full base ref must be fetchable for the diff.
+    - name: Fetch base
+      shell: bash
+      run: git fetch --no-tags --depth=1 origin "${{ github.base_ref }}" || true
+
+    - name: Update graph
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.db }}" ]; then "$CHITRA_BIN" update --db "${{ inputs.db }}"; \
+        else "$CHITRA_BIN" build --db "${{ inputs.db }}"; fi
+
+    - name: Detect changes
+      id: detect
+      shell: bash
+      run: |
+        "$CHITRA_BIN" detect-changes --base "${{ inputs.base }}" --limit "${{ inputs.limit }}" \
+          --db "${{ inputs.db }}" --format md > comment.md
+        "$CHITRA_BIN" detect-changes --base "${{ inputs.base }}" --limit "${{ inputs.limit }}" \
+          --db "${{ inputs.db }}" > report.json
+        echo "high_risk=$(jq -r '.summary.high_risk' report.json)" >> "$GITHUB_OUTPUT"
+
+    # Fork PRs get a read-only token — can't comment. Degrade to a job summary.
+    - name: Post sticky comment (or job summary on forks)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+        else
+          # upsert: find our marker comment, edit it, else create.
+          PR=${{ github.event.pull_request.number }}
+          ID=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" \
+                --jq '.[] | select(.body|startswith("<!-- chitra-review -->")) | .id' | head -1)
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$ID" -F body=@comment.md >/dev/null
+          else
+            gh pr comment "$PR" --body-file comment.md
+          fi
+        fi
+
+    - name: Risk gate
+      if: ${{ inputs.fail-on-risk == 'true' }}
+      shell: bash
+      run: |
+        if [ "${{ steps.detect.outputs.high_risk }}" -gt 0 ]; then
+          echo "::error::${{ steps.detect.outputs.high_risk }} high-risk symbol(s) changed"; exit 1
+        fi

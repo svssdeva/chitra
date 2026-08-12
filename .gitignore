@@ -1,0 +1,8 @@
+/target
+/.chitra
+Cargo.lock.bak
+# SQLite store is binary/not diffable; the deterministic graph.json is the
+# committable artifact (data model §Deterministic JSON export).
+*.db
+*.db-wal
+*.db-shm

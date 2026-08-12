@@ -1,0 +1,13 @@
+[package]
+name = "chitra-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chitra-core = { path = "../chitra-core" }
+serde_json.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

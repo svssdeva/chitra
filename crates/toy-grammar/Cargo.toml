@@ -1,0 +1,19 @@
+# Test fixture only: a shared library exposing a tree-sitter grammar entry point
+# under a name chitra does not know about, so the runtime grammar loader (T4.4)
+# can be tested without shipping a third-party .so.
+[package]
+name = "toy-grammar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tree-sitter-python.workspace = true
+tree-sitter-language.workspace = true
+
+[lints]
+workspace = true

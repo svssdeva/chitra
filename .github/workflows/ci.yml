@@ -1,0 +1,64 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Default features are what a user gets from `cargo install`, so they are
+      # gated too — the optional Phase 4 features only add to this baseline.
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --all-features --locked
+
+  # RISK-4: same repo+commit must export byte-identical graph.json on every OS.
+  determinism:
+    needs: check
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Build the graph of the workspace's own crates *and* the multi-language
+      # fixture. Node identity is a relative path, so it is the most likely thing
+      # to diverge between platforms — the comparison has to cover every
+      # language's identity path, in nested directories, not just Rust.
+      - run: cargo run --release --locked -- build . --db graph.db
+      - run: cargo run --release --locked -- export --db graph.db --out graph.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graph-${{ matrix.os }}
+          path: graph.json
+
+  compare:
+    needs: determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: graphs
+      # built_at_commit is identical (same SHA); the whole file must match byte-for-byte.
+      - name: byte-compare all three OS exports
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(graphs/graph-*/graph.json)
+          echo "comparing ${#files[@]} exports"
+          for f in "${files[@]:1}"; do
+            if ! diff -q "${files[0]}" "$f"; then
+              echo "::error::graph.json differs between platforms ($f)"; exit 1
+            fi
+          done
+          echo "all platform exports are byte-identical"

@@ -1,0 +1,8 @@
+# CI byte-compares the graph export across Linux, macOS and Windows. Line-ending
+# translation on checkout would make the three platforms read different bytes
+# for the same commit, so keep every text file LF in the working tree too.
+* text=auto eol=lf
+
+# Test fixtures are compared as parsed, not as text — pin them explicitly so a
+# future core.autocrlf setting cannot reach them.
+tests/fixture/** text eol=lf

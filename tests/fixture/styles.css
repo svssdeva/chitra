@@ -1,0 +1,7 @@
+:root {
+  --brand: #0099ff;
+}
+
+.card {
+  color: var(--brand);
+}

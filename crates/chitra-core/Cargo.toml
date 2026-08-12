@@ -1,0 +1,27 @@
+[package]
+name = "chitra-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# T4.1: module-evidence tie-breaking for ambiguous call sites.
+deep-resolve = []
+# T4.2: local signature vectors + hybrid search. No model, no network.
+embeddings = []
+# T4.4: runtime grammar loading (see chitra-lang).
+dynamic-grammars = ["chitra-lang/dynamic-grammars"]
+
+[dependencies]
+chitra-lang = { path = "../chitra-lang" }
+rusqlite.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+rayon.workspace = true
+ignore.workspace = true
+serde_json.workspace = true
+tiktoken-rs.workspace = true
+
+[lints]
+workspace = true
