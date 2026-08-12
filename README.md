@@ -1,5 +1,10 @@
 # chitra
 
+[![CI](https://github.com/svssdeva/chitra/actions/workflows/ci.yml/badge.svg)](https://github.com/svssdeva/chitra/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange.svg)](rust-toolchain.toml)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
+
 **Tell your AI reviewer exactly which functions a change affects, how risky they
 are, and why — in hundreds of tokens instead of hundreds of thousands.**
 
@@ -142,6 +147,16 @@ cargo build --features dynamic-grammars  # load a grammar that is not compiled i
 
 Each has a real cost as well as a benefit — [docs/configuration.md](docs/configuration.md#optional-build-features)
 covers both, including the case where `deep-resolve` does nothing at all.
+
+## Platform support
+
+Linux, macOS, and Windows, from one codebase with no platform-specific
+constructs. Every push runs fmt, clippy, and both test suites on all three, then
+builds the graph on each and byte-compares the three `graph.json` exports.
+
+That last job is the interesting one. Node identity is a relative path, so it is
+the most likely thing to diverge between platforms — which makes the comparison
+the sharpest correctness test in the project rather than a formality.
 
 ## Known gaps
 

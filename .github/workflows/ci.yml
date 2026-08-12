@@ -18,6 +18,11 @@ jobs:
       # Default features are what a user gets from `cargo install`, so they are
       # gated too — the optional Phase 4 features only add to this baseline.
       - run: cargo test --workspace --locked
+      # `cargo test` never emits a cdylib artifact, so the dynamic-grammar
+      # acceptance test cannot find its fixture library unless it is built
+      # explicitly first. On a developer machine an earlier `cargo build` hides
+      # this; on a clean checkout it does not.
+      - run: cargo build -p toy-grammar --locked
       - run: cargo test --workspace --all-features --locked
 
   # RISK-4: same repo+commit must export byte-identical graph.json on every OS.

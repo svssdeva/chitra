@@ -22,8 +22,14 @@ Before opening a pull request, run what CI runs:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
+cargo build -p toy-grammar --locked      # fixture for the dynamic-grammar test
 cargo test --workspace --all-features --locked
 ```
+
+The `toy-grammar` build is not optional. `cargo test` never emits a cdylib
+artifact, and the dynamic-grammar acceptance test loads one — so without that
+line the test fails on a clean checkout, while passing on a machine where an
+earlier `cargo build` happened to leave the library behind.
 
 Warnings are denied. Both feature sets are gated, because the optional features
 add to the default build rather than replacing it — a change that only compiles
