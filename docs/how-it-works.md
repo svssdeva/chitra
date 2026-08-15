@@ -42,11 +42,42 @@ Rather than guess and be quietly wrong, every edge carries a tier:
 | `INFERRED` | Exactly one plausible definition exists anywhere in the repository. | Yes |
 | `AMBIGUOUS` | Several definitions match. chitra will not pick one. | **No** |
 
-Two guards sit in front of this. The **single-candidate guard** means a bare
+Three guards sit in front of this. The **single-candidate guard** means a bare
 name resolves only when exactly one candidate exists. The
 **cross-language-family guard** stops a Python call from resolving to a
 same-named Go function. There is exactly one sanctioned cross-language edge —
 HTML and CSS, which genuinely are one def/use graph.
+
+The third is the **foreign-type guard**, and on a real codebase it does the most
+work. `Box::new()`, `Math.floor()`, `JSON.parse()` are all written through a
+type, and it is a type defined outside your repository. Matching them on the
+bare name is not merely useless, it is wrong: if the repo happens to contain one
+function called `new`, `Box::new()` binds confidently to it. Rust, Go, and
+TypeScript all spell types in UpperCamelCase and modules in lower case, so a
+capitalised qualifier naming a type chitra never parsed means the definition
+isn't here, and the call resolves to nothing.
+
+On a 7,000-file monorepo that one rule removed **24,142 phantom edges** — 60% of
+all ambiguity — and took the confidently-resolved share from 10.7% to 23.2%.
+
+### Types are evidence, not targets
+
+chitra parses type declarations — `struct`, `enum`, `trait`, `impl`, `class`,
+`interface`, `type` — into `Type` nodes. They are never call targets. They exist
+so that the qualifier in `Foo::new()` has something in the graph to match
+against: keep only the candidates defined where that type's code lives, and if
+exactly one remains, assert it.
+
+Rust needs the `impl` blocks as much as the declaration, because `struct Foo`
+and `impl Foo` are frequently in different files and the methods live with the
+`impl`.
+
+Being honest about the size of this win: it resolves first-party constructor
+calls correctly, but there are fewer of those than you would expect. On that
+monorepo only 89 of 989 Rust `new` calls went through a type defined in the
+repository at all — the rest were `Box`, `Vec`, `Arc`, `Router`. The value of
+type nodes turned out to be mostly in what they let the foreign-type guard
+*reject*.
 
 Ambiguous edges are counted and surfaced, never hidden. But they do not drive
 impact analysis and they are not drawn in the visualization.
@@ -58,10 +89,11 @@ lookup. An invented edge costs them their trust in every other edge, and they
 have no way to tell which kind they are looking at.
 
 This means chitra under-connects, and on some codebases it under-connects a lot.
-On a large polyglot monorepo, 89% of edges came back ambiguous — dominated by
-constructor calls (`new`, `New`) and method names shared across dozens of types.
-That is the discipline working as designed, and it is also a real limitation: on
-that repository, impact analysis answers less than you would want. See
+On a large polyglot monorepo, 77% of edges still come back ambiguous, dominated
+by method names shared across dozens of types (`get`, `as_str`) and by CSS class
+names repeated across per-component stylesheets. That is the discipline working
+as designed, and it is also a real limitation: on that repository, impact
+analysis answers less than you would want. See
 [known gaps](../README.md#known-gaps).
 
 ## Determinism
@@ -95,7 +127,15 @@ cleverer.
 
 One SQLite file, `.chitra/graph.db`, in WAL mode. Nodes and edges are ordinary
 tables; impact analysis is a recursive CTE doing a bounded breadth-first search
-inside SQLite rather than in application code. Search is FTS5.
+inside SQLite rather than in application code. Search is FTS5 over four columns:
+qualified name, name, signature, and doc comment.
+
+The doc column is the only place prose enters the graph. During parsing, the
+comment block immediately above a declaration — or the leading string inside its
+body, for Python — is collapsed to a single line and capped at 400 characters.
+It is retrieval material, nothing more: docs never create edges and never
+influence resolution. Function bodies are not indexed at all, which is what
+keeps the index small enough to stay in one file next to the graph.
 
 Schema migrations are forward-only and run on open.
 

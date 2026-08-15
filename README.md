@@ -162,10 +162,9 @@ the sharpest correctness test in the project rather than a formality.
 
 Stated plainly, because you will hit some of these.
 
-- **No Class or Type nodes.** This is the big one. `Foo::new()` cannot resolve,
-  because `Foo` is a type name and there is nothing to map it to. On a large
-  polyglot monorepo this left 89% of edges ambiguous, dominated by constructors.
-  Fixing it is the highest-value improvement available.
+- **Method calls on values are unresolved.** `x.parse()` carries no evidence
+  about what `x` is, and chitra does not infer types. Calls written through a
+  type (`Foo::new()`, `Foo.parse()`) resolve; calls through a variable do not.
 - **No framework awareness.** Event publishers, HTTP route handlers, and dependency
   injection are invisible — chitra sees calls, not conventions.
 - **MCP transport is stdio only.** No streamable HTTP.

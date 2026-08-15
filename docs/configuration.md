@@ -69,11 +69,17 @@ Optional keys:
 | Key | Effect |
 |---|---|
 | `import_query` | Captures `@import`, optionally `@module`. Import evidence is what promotes an edge to a confident tier. |
+| `type_query` | Captures `@name` and `@def` for type declarations. Worth adding: it is what lets `Foo::new()` resolve, and what lets calls through *foreign* types be rejected instead of guessed at. |
+| `doc_in_body` | Set true when the language puts documentation *inside* the declaration (a Python docstring) rather than in comments above it. Default false. |
 | `test_prefixes` | Name prefixes that mark a test, for test linking. |
 | `callee_separator` | Split one captured callee into several on this character. |
 | `resolve_languages` | Which languages this one may resolve calls into. |
 | `merge_duplicate_defs` | Treat repeated definitions of a name as one node. |
 | `emit_file_node` | Emit a node for the file itself. |
+
+Doc comments are picked up without configuration: the comment block directly
+above a declaration is indexed for search, and `doc_in_body = true` switches that
+to the first string inside the body instead.
 
 Queries are compiled when the file loads, so a typo warns once rather than once
 per file. A malformed file is skipped with a warning and never fails a build.

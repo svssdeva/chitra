@@ -176,7 +176,20 @@ fn resolve(store: &mut Store, resolve_map: &HashMap<String, Vec<String>>) -> Res
         .collect();
     let mut same_file: HashMap<(&str, &str), Vec<&Node>> = HashMap::new();
     let mut global: HashMap<&str, Vec<&Node>> = HashMap::new();
+    // Type name -> every file holding that type's code. In Rust a type is
+    // declared in one file and its methods often live in another (`impl Foo`),
+    // so this is a set rather than a single file.
+    let mut type_files: HashMap<&str, HashSet<&str>> = HashMap::new();
     for n in &nodes {
+        if n.kind == "Type" {
+            // A type is evidence about where methods live, not something a call
+            // site can target, so it is kept out of the candidate maps entirely.
+            type_files
+                .entry(n.name.as_str())
+                .or_default()
+                .insert(n.file.as_str());
+            continue;
+        }
         same_file
             .entry((n.file.as_str(), n.name.as_str()))
             .or_default()
@@ -210,6 +223,19 @@ fn resolve(store: &mut Store, resolve_map: &HashMap<String, Vec<String>>) -> Res
             .get(lang)
             .map(|v| v.as_slice())
             .unwrap_or(std::slice::from_ref(&caller_node.language));
+
+        // 0. A call through a type that is not in this repository.
+        //
+        // `Box::new()`, `Math.floor()`, `JSON.parse()` — the qualifier names a
+        // type, and it is one we never parsed, so the definition lives outside
+        // the repo and there is nothing here to point at. Matching on the bare
+        // name anyway is actively wrong: it either invents an INFERRED edge to
+        // an unrelated local `new`, or fans out across every one of them. On a
+        // real monorepo `Box::new` alone accounted for 593 call sites, all of
+        // them noise.
+        if names_a_foreign_type(rc, &type_files) {
+            continue;
+        }
 
         // 1. same-file
         if let Some(sf) = same_file.get(&(file.as_str(), callee.as_str())) {
@@ -245,6 +271,14 @@ fn resolve(store: &mut Store, resolve_map: &HashMap<String, Vec<String>>) -> Res
                 push(caller, &cands[0].qualified_name, line, conf, tier);
             }
             _ => {
+                // The qualifier names a type we have in the graph: `Foo::new()`,
+                // `Foo.parse()`. Keep only candidates defined where that type's
+                // code lives. This is the constructor case, and on an
+                // object-oriented codebase it is most of the ambiguity.
+                if let Some(pick) = type_pick(&cands, rc, &type_files) {
+                    push(caller, &pick.qualified_name, line, 0.85, "EXTRACTED");
+                    continue;
+                }
                 // Deep resolution (T4.1) gets one attempt to break the tie before
                 // the call is written off as ambiguous.
                 #[cfg(feature = "deep-resolve")]
@@ -300,6 +334,63 @@ fn resolve(store: &mut Store, resolve_map: &HashMap<String, Vec<String>>) -> Res
 /// The single-candidate guard is preserved throughout: a target is returned only
 /// when exactly one candidate matches, so recall rises without spending
 /// precision.
+/// Does this call go through a type that lives outside the repository?
+///
+/// Rust, Go and TypeScript all spell types in UpperCamelCase and modules in
+/// lower case, so a capitalised qualifier is a type with high reliability. If
+/// that type is not one chitra parsed, its methods are not here either.
+///
+/// This only ever *removes* candidates, so it cannot invent an edge. The
+/// failure mode is dropping a call to a first-party type whose declaration
+/// chitra missed — and a missing edge is the error this codebase prefers.
+fn names_a_foreign_type(
+    rc: &crate::store::RawCallRow,
+    type_files: &HashMap<&str, HashSet<&str>>,
+) -> bool {
+    let Some(q) = rc.qualifier.as_deref() else {
+        return false;
+    };
+    // `Self` is capitalised but names the impl currently being written, which is
+    // in this very file. Treating it as foreign would silently drop every
+    // `Self::helper()` call in a Rust codebase; the same-file rule below already
+    // resolves it correctly.
+    if q == "Self" {
+        return false;
+    }
+    let Some(first) = q.chars().next() else {
+        return false;
+    };
+    first.is_uppercase() && !type_files.contains_key(q)
+}
+
+/// Break a tie using the call-site qualifier when it names a **type we parsed**.
+///
+/// `Foo::new()` carries the qualifier `Foo`. Until types were nodes there was
+/// nothing to match it against, so every constructor call in the repository
+/// collapsed into one enormous ambiguous bucket — `new` alone accounted for
+/// 90,600 ambiguous edges on a real monorepo, and no amount of module-name
+/// heuristics touched it, because `Foo` is a type name and not a path.
+///
+/// The single-candidate guard still holds: a target comes back only when
+/// exactly one candidate sits in a file where that type's code lives. This is
+/// unconditional rather than feature-gated, because unlike a file-stem
+/// heuristic it matches a declaration chitra actually saw.
+fn type_pick<'a>(
+    cands: &[&&'a Node],
+    rc: &crate::store::RawCallRow,
+    type_files: &HashMap<&str, HashSet<&str>>,
+) -> Option<&'a Node> {
+    let files = type_files.get(rc.qualifier.as_deref()?)?;
+    let mut matched = cands
+        .iter()
+        .map(|c| **c)
+        .filter(|c| files.contains(c.file.as_str()));
+    match (matched.next(), matched.next()) {
+        (Some(only), None) => Some(only),
+        _ => None, // no match, or several — stay ambiguous
+    }
+}
+
 #[cfg(feature = "deep-resolve")]
 fn deep_pick<'a>(
     cands: &[&&'a Node],
@@ -470,6 +561,190 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The point of indexing doc comments: prose describes a symbol in words its
+    /// name does not contain. Neither "retry" nor "backoff" appears in
+    /// `attempt_once`, so before this the search could not find it at all.
+    #[test]
+    fn a_symbol_is_findable_by_its_doc_comment() {
+        let dir = fresh("chitra_doc_search");
+        write(
+            &dir,
+            "net.rs",
+            "/// Retry the request with exponential backoff.
+fn attempt_once() -> i32 { 1 }
+",
+        );
+        write(
+            &dir,
+            "other.rs",
+            "fn unrelated() -> i32 { 2 }
+",
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+        assert_eq!(
+            store.search("backoff", 10).unwrap(),
+            vec!["net.rs::attempt_once".to_string()]
+        );
+        assert_eq!(
+            store.search("exponential", 10).unwrap(),
+            vec!["net.rs::attempt_once".to_string()]
+        );
+    }
+
+    /// Python puts its prose inside the definition, not above it.
+    #[test]
+    fn a_python_docstring_is_indexed() {
+        let dir = fresh("chitra_doc_py");
+        write(
+            &dir,
+            "auth.py",
+            "def check(u):
+    \"\"\"Verify the caller is who they claim to be.\"\"\"
+    return True
+",
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+        assert_eq!(
+            store.search("caller claim", 10).unwrap(),
+            vec!["auth.py::check".to_string()]
+        );
+    }
+
+    /// The constructor case. Two types each expose `new`, so the bare name is
+    /// ambiguous and stays that way under every name-based heuristic. The
+    /// qualifier `Config` / `Client` is a *type*, and only a graph that holds
+    /// types can use it.
+    #[test]
+    fn a_qualified_constructor_resolves_to_its_own_type() {
+        let dir = fresh("chitra_type_ctor");
+        write(
+            &dir,
+            "config.rs",
+            "pub struct Config { pub a: i32 }
+impl Config { pub fn new() -> Config { Config { a: 1 } } }
+",
+        );
+        write(
+            &dir,
+            "client.rs",
+            "pub struct Client { pub b: i32 }
+impl Client { pub fn new() -> Client { Client { b: 2 } } }
+",
+        );
+        write(
+            &dir,
+            "app.rs",
+            "fn boot() { let c = Config::new(); let d = Client::new(); }
+",
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+
+        let out = store.callees_of("app.rs::boot").unwrap();
+        assert!(
+            out.contains(&"config.rs::new".to_string()),
+            "Config::new() must bind to config.rs, got {out:?}"
+        );
+        assert!(
+            out.contains(&"client.rs::new".to_string()),
+            "Client::new() must bind to client.rs, got {out:?}"
+        );
+        // And the reverse direction is what impact analysis actually reads.
+        let dependents = store.impact("config.rs::new", 3).unwrap();
+        assert_eq!(dependents, vec!["app.rs::boot".to_string()]);
+    }
+
+    /// The dominant source of ambiguity on a real repo was not first-party
+    /// constructors but `Box::new`, `Vec::new`, `Arc::new` — calls through
+    /// types defined outside the repository. Matching those on the bare name
+    /// invents an edge to an unrelated local function.
+    #[test]
+    fn a_call_through_a_foreign_type_resolves_to_nothing() {
+        let dir = fresh("chitra_foreign_type");
+        // Exactly one local `new`, so without the guard this call would be
+        // asserted with full confidence to entirely the wrong function.
+        write(
+            &dir,
+            "thing.rs",
+            "pub struct Thing;
+impl Thing { pub fn new() -> Thing { Thing } }
+",
+        );
+        write(
+            &dir,
+            "app.rs",
+            "fn run() { let b = Box::new(1); }
+",
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+        assert!(
+            store.callees_of("app.rs::run").unwrap().is_empty(),
+            "Box is not a type in this repo, so Box::new must bind to nothing"
+        );
+        // A lower-case qualifier is a module path, not a type, and is left alone.
+        assert!(store.get_node("thing.rs::new").unwrap().is_some());
+    }
+
+    /// `Self::` is capitalised, so a naive foreign-type check kills it — and it
+    /// is one of the most common ways a Rust method calls its neighbour.
+    #[test]
+    fn a_self_qualified_call_still_resolves() {
+        let dir = fresh("chitra_self_qual");
+        write(
+            &dir,
+            "a.rs",
+            "pub struct Config { pub a: i32 }
+impl Config {
+    pub fn helper() -> i32 { 3 }
+    pub fn go() -> i32 { Self::helper() }
+}
+",
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+        assert_eq!(
+            store.callees_of("a.rs::go").unwrap(),
+            vec!["a.rs::helper".to_string()],
+            "Self:: names the impl in this file, not a foreign type"
+        );
+    }
+
+    /// The guard has to hold in the other direction too: a qualifier naming a
+    /// type whose file holds *several* matching candidates is still ambiguous.
+    #[test]
+    fn an_unresolvable_constructor_stays_ambiguous() {
+        let dir = fresh("chitra_type_ambig");
+        write(
+            &dir,
+            "a.rs",
+            "pub struct Thing { x: i32 }
+fn new() -> i32 { 1 }
+",
+        );
+        write(
+            &dir,
+            "b.rs",
+            "fn new() -> i32 { 2 }
+",
+        );
+        write(
+            &dir,
+            "c.rs",
+            "fn go() { Missing::new(); }
+",
+        );
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+        // `Missing` is not a type chitra saw, so nothing is asserted.
+        assert!(
+            store.callees_of("c.rs::go").unwrap().is_empty(),
+            "an unknown qualifier must not resolve"
+        );
     }
 
     /// End-to-end full build: nodes, cross-file edges, impact, TESTED_BY.

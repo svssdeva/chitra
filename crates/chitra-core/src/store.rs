@@ -7,7 +7,7 @@ use chitra_lang::{Import, Node, ParsedFile};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS files(
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS nodes(
     line_end    INTEGER,
     language    TEXT,
     signature   TEXT,
+    doc         TEXT,
     is_test     INTEGER,
     community_id INTEGER
 );
@@ -145,6 +146,8 @@ impl Store {
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN community_id INTEGER", []);
         let _ = conn.execute("ALTER TABLE imports ADD COLUMN module TEXT", []);
         let _ = conn.execute("ALTER TABLE raw_calls ADD COLUMN qualifier TEXT", []);
+        // v4 predates node docs.
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN doc TEXT", []);
         conn.execute(
             "INSERT OR REPLACE INTO metadata VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -213,8 +216,8 @@ impl Store {
         for n in &pf.nodes {
             tx.execute(
                 "INSERT OR REPLACE INTO nodes
-                 (qualified_name,kind,name,file,line_start,line_end,language,signature,is_test)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 (qualified_name,kind,name,file,line_start,line_end,language,signature,doc,is_test)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     n.qualified_name,
                     n.kind,
@@ -224,6 +227,7 @@ impl Store {
                     n.line_end as i64,
                     n.language,
                     n.signature,
+                    n.doc,
                     n.is_test as i64
                 ],
             )?;
@@ -267,7 +271,7 @@ impl Store {
 
     pub fn load_nodes(&self) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare(
-            "SELECT qualified_name,kind,name,file,line_start,line_end,language,signature,is_test
+            "SELECT qualified_name,kind,name,file,line_start,line_end,language,signature,coalesce(doc,''),is_test
              FROM nodes ORDER BY qualified_name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -280,7 +284,8 @@ impl Store {
                 line_end: r.get::<_, i64>(5)? as usize,
                 language: r.get(6)?,
                 signature: r.get(7)?,
-                is_test: r.get::<_, i64>(8)? != 0,
+                doc: r.get(8)?,
+                is_test: r.get::<_, i64>(9)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -378,8 +383,8 @@ impl Store {
     pub fn insert_node(&self, n: &Node) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO nodes
-             (qualified_name,kind,name,file,line_start,line_end,language,signature,is_test)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+             (qualified_name,kind,name,file,line_start,line_end,language,signature,doc,is_test)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 n.qualified_name,
                 n.kind,
@@ -389,6 +394,7 @@ impl Store {
                 n.line_end as i64,
                 n.language,
                 n.signature,
+                n.doc,
                 n.is_test as i64
             ],
         )?;
@@ -404,8 +410,8 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO nodes
-                 (qualified_name,kind,name,file,line_start,line_end,language,signature,is_test)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 (qualified_name,kind,name,file,line_start,line_end,language,signature,doc,is_test)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             )?;
             for n in nodes {
                 stmt.execute(params![
@@ -417,6 +423,7 @@ impl Store {
                     n.line_end as i64,
                     n.language,
                     n.signature,
+                    n.doc,
                     n.is_test as i64
                 ])?;
             }
@@ -470,7 +477,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT qualified_name,kind,name,file,line_start,line_end,language,signature,is_test
+                "SELECT qualified_name,kind,name,file,line_start,line_end,language,signature,coalesce(doc,''),is_test
                  FROM nodes WHERE qualified_name = ?1",
                 params![qn],
                 |r| {
@@ -483,7 +490,8 @@ impl Store {
                         line_end: r.get::<_, i64>(5)? as usize,
                         language: r.get(6)?,
                         signature: r.get(7)?,
-                        is_test: r.get::<_, i64>(8)? != 0,
+                        doc: r.get(8)?,
+                        is_test: r.get::<_, i64>(9)? != 0,
                     })
                 },
             )
@@ -493,7 +501,7 @@ impl Store {
     /// All nodes defined in one file, sorted by line.
     pub fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare(
-            "SELECT qualified_name,kind,name,file,line_start,line_end,language,signature,is_test
+            "SELECT qualified_name,kind,name,file,line_start,line_end,language,signature,coalesce(doc,''),is_test
              FROM nodes WHERE file = ?1 ORDER BY line_start",
         )?;
         let rows = stmt.query_map(params![file], |r| {
@@ -506,7 +514,8 @@ impl Store {
                 line_end: r.get::<_, i64>(5)? as usize,
                 language: r.get(6)?,
                 signature: r.get(7)?,
-                is_test: r.get::<_, i64>(8)? != 0,
+                doc: r.get(8)?,
+                is_test: r.get::<_, i64>(9)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -558,9 +567,9 @@ impl Store {
     pub fn rebuild_fts(&self) -> Result<()> {
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS nodes_fts;
-             CREATE VIRTUAL TABLE nodes_fts USING fts5(qualified_name, name, file, signature);
-             INSERT INTO nodes_fts(qualified_name,name,file,signature)
-                 SELECT qualified_name,name,file,signature FROM nodes;",
+             CREATE VIRTUAL TABLE nodes_fts USING fts5(qualified_name, name, file, signature, doc);
+             INSERT INTO nodes_fts(qualified_name,name,file,signature,doc)
+                 SELECT qualified_name,name,file,signature,coalesce(doc,'') FROM nodes;",
         )?;
         Ok(())
     }

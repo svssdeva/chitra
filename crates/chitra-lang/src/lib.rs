@@ -11,19 +11,27 @@ use streaming_iterator::StreamingIterator; // 0.24: QueryCursor::matches streams
 use tree_sitter::{Language, Node as TsNode, Parser, Query, QueryCursor};
 use tree_sitter_language::LanguageFn;
 
-/// A code entity. Phase 1: functions/methods (kind `Function`, or `Test` when
-/// the symbol looks like a test). Classes/types are deferred (call-graph review
-/// is function-centric).
+/// A code entity: functions and methods (`Function`, or `Test` when the symbol
+/// looks like one), type declarations (`Type`), and a whole-file node (`File`)
+/// for languages whose references live outside any definition.
+///
+/// `Type` nodes are not call targets. They exist so the qualifier in
+/// `Foo::new()` has something in the graph to match against — without them a
+/// constructor call has no evidence at all and stays ambiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub qualified_name: String, // `file::name`, `#L<line>`-suffixed on collision
-    pub kind: String,           // "Function" | "Test"
+    pub kind: String,           // "Function" | "Test" | "Type" | "File"
     pub name: String,
     pub file: String,
     pub line_start: usize,
     pub line_end: usize,
     pub language: String,
     pub signature: String, // first line of the def, whitespace-collapsed (heuristic)
+    /// Doc comment attached to the definition, whitespace-collapsed and capped.
+    /// Indexed for search: it is the only prose chitra holds, and it describes a
+    /// symbol in words its name may not contain.
+    pub doc: String,
     pub is_test: bool,
 }
 
@@ -76,6 +84,14 @@ pub struct LanguageConfig {
     pub function_query: String,
     /// Call-site query: must capture `@callee`.
     pub call_query: String,
+    /// Type/class declaration query, capturing `@name` and `@def`. Optional: a
+    /// language without a type system (CSS, HTML) simply has none.
+    ///
+    /// A type node is not a call target on its own — it exists so that the
+    /// qualifier in `Foo::new()` has something in the graph to match against.
+    /// Patterns that mark *where a type's code lives* (Rust `impl` blocks) are
+    /// as useful here as the declaration itself, and both are captured.
+    pub type_query: Option<String>,
     /// Import query capturing `@import` (short imported name) and optionally
     /// `@module` (where it came from). `None` = language resolves fine on
     /// unique-global evidence alone (Go).
@@ -96,6 +112,9 @@ pub struct LanguageConfig {
     /// Emit a `<file>` node so references written outside any definition still
     /// have a source. HTML markup is not inside a function.
     pub emit_file_node: bool,
+    /// The doc comment lives *inside* the definition as its first statement (a
+    /// Python docstring) rather than in comments above it.
+    pub doc_in_body: bool,
 }
 
 impl LanguageConfig {
@@ -120,6 +139,8 @@ impl LanguageConfig {
             resolve_languages: vec![language.to_string()],
             merge_duplicate_defs: false,
             emit_file_node: false,
+            type_query: None,
+            doc_in_body: false,
         }
     }
 }
@@ -139,6 +160,16 @@ fn strs(v: &[&str]) -> Vec<String> {
 
 pub fn rust_config() -> LanguageConfig {
     LanguageConfig {
+        // `impl Foo` matters as much as `struct Foo` here: the methods a call
+        // like `Foo::new()` is looking for live in the impl block, which is
+        // often not the file the struct is declared in.
+        type_query: Some(
+            "(struct_item name: (type_identifier) @name) @def\n\
+             (enum_item name: (type_identifier) @name) @def\n\
+             (trait_item name: (type_identifier) @name) @def\n\
+             (impl_item type: (type_identifier) @name) @def"
+                .to_string(),
+        ),
         // `use a::b::c;` and `use a::b::{c, d};` — the module half is real
         // resolution evidence in Rust, which has no dynamic import to confuse it.
         import_query: Some(
@@ -163,6 +194,8 @@ pub fn rust_config() -> LanguageConfig {
 
 pub fn python_config() -> LanguageConfig {
     LanguageConfig {
+        doc_in_body: true,
+        type_query: Some("(class_definition name: (identifier) @name) @def".to_string()),
         // Pattern 1 carries the module (deep-resolve evidence); 2 keeps relative
         // imports (`from . import x`) that pattern 1 can't match. Duplicates are
         // collapsed in `parse`.
@@ -189,6 +222,9 @@ pub fn python_config() -> LanguageConfig {
 
 pub fn go_config() -> LanguageConfig {
     LanguageConfig {
+        type_query: Some(
+            "(type_declaration (type_spec name: (type_identifier) @name)) @def".to_string(),
+        ),
         // Go imports bind a package, not individual symbols, so there is no
         // @import to capture — the call-site qualifier carries the evidence.
         test_prefixes: strs(&["Test", "Benchmark", "Fuzz"]),
@@ -209,6 +245,12 @@ pub fn go_config() -> LanguageConfig {
 
 fn ts_config_for(extensions: &[&str], grammar: LanguageFn) -> LanguageConfig {
     LanguageConfig {
+        type_query: Some(
+            "(class_declaration name: (type_identifier) @name) @def\n\
+             (interface_declaration name: (type_identifier) @name) @def\n\
+             (type_alias_declaration name: (type_identifier) @name) @def"
+                .to_string(),
+        ),
         import_query: Some(
             // Child order is significant: the grammar puts the clause before `from <source>`.
             "(import_statement (import_clause (named_imports (import_specifier name: (identifier) @import))) source: (string) @module)"
@@ -479,6 +521,10 @@ fn language_from_toml(entry: &toml::Value) -> Result<LanguageConfig> {
             .get("import_query")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        type_query: entry
+            .get("type_query")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         test_prefixes: get_list("test_prefixes"),
         callee_separator: entry
             .get("callee_separator")
@@ -491,6 +537,10 @@ fn language_from_toml(entry: &toml::Value) -> Result<LanguageConfig> {
             .unwrap_or(false),
         emit_file_node: entry
             .get("emit_file_node")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        doc_in_body: entry
+            .get("doc_in_body")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     };
@@ -569,6 +619,12 @@ fn validate_queries(cfg: &LanguageConfig) -> Result<()> {
             return Err(anyhow!("import_query must capture @import"));
         }
     }
+    if let Some(tq) = &cfg.type_query {
+        let q = Query::new(&language, tq).context("type_query")?;
+        if q.capture_index_for_name("name").is_none() || q.capture_index_for_name("def").is_none() {
+            return Err(anyhow!("type_query must capture both @name and @def"));
+        }
+    }
     Ok(())
 }
 
@@ -610,6 +666,7 @@ pub fn parse(cfg: &LanguageConfig, file: &str, source: &str) -> Result<ParsedFil
             line_end: source.lines().count().max(1),
             language: cfg.language.clone(),
             signature: String::new(),
+            doc: String::new(),
             is_test: file_is_test,
         });
     }
@@ -667,8 +724,62 @@ pub fn parse(cfg: &LanguageConfig, file: &str, source: &str) -> Result<ParsedFil
             line_end: e + 1,
             language: cfg.language.clone(),
             signature: signature_of(dn, bytes),
+            doc: doc_of(dn, bytes, cfg.doc_in_body),
             is_test,
         });
+    }
+
+    // --- type declarations ---
+    //
+    // Deliberately NOT added to `def_ranges`: a call inside a class body should
+    // still attribute to the enclosing method, and widening the scope table
+    // would silently re-parent existing edges.
+    if let Some(tq) = &cfg.type_query {
+        let tq = Query::new(&language, tq)?;
+        let t_name = tq
+            .capture_index_for_name("name")
+            .context("type_query missing @name capture")?;
+        let t_def = tq
+            .capture_index_for_name("def")
+            .context("type_query missing @def capture")?;
+        let mut tc = QueryCursor::new();
+        let mut tm = tc.matches(&tq, root, bytes);
+        while let Some(m) = tm.next() {
+            let mut name = None;
+            let mut def_node = None;
+            for c in m.captures.iter() {
+                if c.index == t_name {
+                    name = Some(c.node.utf8_text(bytes)?.to_string());
+                } else if c.index == t_def {
+                    def_node = Some(c.node);
+                }
+            }
+            let (Some(name), Some(dn)) = (name, def_node) else {
+                continue;
+            };
+            let (s, e) = (dn.start_position().row, dn.end_position().row);
+            // Shares `seen` with functions so one file can never mint two nodes
+            // under the same qualified name.
+            let base = format!("{file}::{name}");
+            let qn = if seen.contains_key(&base) {
+                format!("{base}#L{}", s + 1)
+            } else {
+                base.clone()
+            };
+            *seen.entry(base).or_insert(0) += 1;
+            nodes.push(Node {
+                qualified_name: qn,
+                kind: "Type".to_string(),
+                name,
+                file: file.to_string(),
+                line_start: s + 1,
+                line_end: e + 1,
+                language: cfg.language.clone(),
+                signature: signature_of(dn, bytes),
+                doc: doc_of(dn, bytes, cfg.doc_in_body),
+                is_test: file_is_test,
+            });
+        }
     }
 
     // --- call sites ---
@@ -851,6 +962,83 @@ fn signature_of(def: TsNode, bytes: &[u8]) -> String {
         .or_else(|| text.find('\n'))
         .unwrap_or(text.len());
     text[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Doc comment for a definition: the run of comment lines immediately above it,
+/// or — for languages that put it inside — the first string in the body.
+///
+/// Whitespace-collapsed, which also strips the carriage return a CRLF
+/// checkout would
+/// otherwise leak into the graph and break cross-platform byte equality. Capped,
+/// because a 200-line module docstring is not a search term.
+fn doc_of(def: TsNode, bytes: &[u8], in_body: bool) -> String {
+    const CAP: usize = 400;
+    let mut parts: Vec<String> = Vec::new();
+    if in_body {
+        // A Python docstring: the first statement in the body is a string.
+        if let Some(body) = def.child_by_field_name("body") {
+            if let Some(first) = body.named_child(0) {
+                let n = if first.kind() == "expression_statement" {
+                    first.named_child(0)
+                } else {
+                    Some(first)
+                };
+                if let Some(n) = n.filter(|n| n.kind() == "string") {
+                    parts.push(n.utf8_text(bytes).unwrap_or("").to_string());
+                }
+            }
+        }
+    } else {
+        // The comment is rarely the immediately preceding sibling. An attribute
+        // or decorator usually sits between it and the definition
+        // (`/// Doc` / `#[derive(Debug)]` / `struct Foo`), and in TypeScript the
+        // definition is *nested inside* the `export` statement the comment sits
+        // above. Miss either and the doc channel is empty for most public API,
+        // which is exactly the code worth finding.
+        let mut node = def;
+        'walk: loop {
+            let mut cur = node.prev_sibling();
+            while let Some(n) = cur {
+                if n.kind().contains("comment") {
+                    parts.push(n.utf8_text(bytes).unwrap_or("").to_string());
+                } else if !is_decoration(n.kind()) {
+                    break 'walk;
+                }
+                cur = n.prev_sibling();
+            }
+            // Nothing left at this level: the comment may sit above the wrapper.
+            // Only climb one that *opens before* the definition — `export class`
+            // qualifies, a block does not, and a block is stopped anyway by its
+            // `{` being neither comment nor decoration.
+            match node.parent() {
+                Some(p) if p.start_byte() < node.start_byte() => node = p,
+                _ => break,
+            }
+        }
+        parts.reverse();
+    }
+    let joined = parts.join(" ");
+    let cleaned: String = joined
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c| c == '/' || c == '#' || c == '*' || c == '"'))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match cleaned.char_indices().nth(CAP) {
+        Some((i, _)) => cleaned[..i].to_string(),
+        None => cleaned,
+    }
+}
+
+/// Node kinds that may sit between a doc comment and the thing it documents.
+/// Everything else ends the walk, so a comment is never stolen from across
+/// unrelated code.
+fn is_decoration(kind: &str) -> bool {
+    kind.contains("attribute")
+        || matches!(
+            kind,
+            "decorator" | "export" | "default" | "async" | "abstract" | "declare"
+        )
 }
 
 /// Path-based test heuristic (covers frameworks that don't use a name prefix).
@@ -1178,5 +1366,157 @@ call_query = "(call function: (identifier) @callee)"
         let qns: Vec<&str> = pf.nodes.iter().map(|n| n.qualified_name.as_str()).collect();
         assert_eq!(qns[0], "m.rs::f");
         assert!(qns[1].starts_with("m.rs::f#L"));
+    }
+}
+
+#[cfg(test)]
+mod type_node_tests {
+    use super::*;
+
+    fn type_names(pf: &ParsedFile) -> Vec<(&str, &str)> {
+        pf.nodes
+            .iter()
+            .filter(|n| n.kind == "Type")
+            .map(|n| (n.name.as_str(), n.qualified_name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn rust_types_include_impl_blocks() {
+        let src = "struct Config { a: i32 }\n\
+                   enum Mode { On }\n\
+                   trait Run { fn go(&self); }\n\
+                   impl Config { fn new() -> Self { Config { a: 1 } } }\n";
+        let pf = parse(&rust_config(), "c.rs", src).unwrap();
+        let names: Vec<&str> = type_names(&pf).iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"Config"), "struct: {names:?}");
+        assert!(names.contains(&"Mode"), "enum: {names:?}");
+        assert!(names.contains(&"Run"), "trait: {names:?}");
+        // `impl Config` is a second node for the same name in one file, so the
+        // collision policy suffixes it rather than dropping it.
+        assert_eq!(
+            names.iter().filter(|n| **n == "Config").count(),
+            2,
+            "struct and impl both mark where Config's code lives: {names:?}"
+        );
+        // The method inside the impl is still a Function, attributed normally.
+        assert!(pf
+            .nodes
+            .iter()
+            .any(|n| n.name == "new" && n.kind == "Function"));
+    }
+
+    #[test]
+    fn python_classes_are_types() {
+        let pf = parse(
+            &python_config(),
+            "m.py",
+            "class Store:\n    def get(self): pass\n",
+        )
+        .unwrap();
+        assert_eq!(type_names(&pf), vec![("Store", "m.py::Store")]);
+        assert!(pf
+            .nodes
+            .iter()
+            .any(|n| n.name == "get" && n.kind == "Function"));
+    }
+
+    #[test]
+    fn typescript_classes_interfaces_and_aliases() {
+        let src = "class Client {}\ninterface Opts {}\ntype Id = string;\n";
+        let pf = parse(
+            &ts_config_for(&["ts"], tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
+            "a.ts",
+            src,
+        )
+        .unwrap();
+        let names: Vec<&str> = type_names(&pf).iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["Client", "Opts", "Id"]);
+    }
+
+    #[test]
+    fn go_type_declarations() {
+        let pf = parse(&go_config(), "s.go", "type Server struct { n int }\n").unwrap();
+        assert_eq!(type_names(&pf), vec![("Server", "s.go::Server")]);
+    }
+
+    fn doc_for<'a>(pf: &'a ParsedFile, name: &str) -> &'a str {
+        pf.nodes
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.doc.as_str())
+            .unwrap_or("<missing node>")
+    }
+
+    /// Almost every documented Rust item carries an attribute between the doc
+    /// and the definition, so a walk that stops at the first non-comment sibling
+    /// indexes nothing that matters.
+    #[test]
+    fn a_doc_comment_survives_an_attribute() {
+        let src = "/// Retries with exponential backoff.\n\
+                   #[derive(Debug)]\n\
+                   pub struct Config { a: i32 }\n\
+                   \n\
+                   /// Parses a descriptor.\n\
+                   #[inline]\n\
+                   pub fn parse_it() -> i32 { 1 }\n";
+        let pf = parse(&rust_config(), "c.rs", src).unwrap();
+        assert!(
+            doc_for(&pf, "Config").contains("backoff"),
+            "struct doc: {:?}",
+            doc_for(&pf, "Config")
+        );
+        assert!(
+            doc_for(&pf, "parse_it").contains("descriptor"),
+            "fn doc: {:?}",
+            doc_for(&pf, "parse_it")
+        );
+    }
+
+    /// In TypeScript the definition is nested inside the `export` statement, so
+    /// the JSDoc is the sibling of the *wrapper*, not of the class.
+    #[test]
+    fn a_jsdoc_survives_an_export_wrapper() {
+        let src = "/** Sends a payload to the queue. */\n\
+                   export class Sender { run() { return 1; } }\n\
+                   \n\
+                   /** Computes a score. */\n\
+                   export function score() { return 2; }\n";
+        let pf = parse(
+            &ts_config_for(&["ts"], tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
+            "a.ts",
+            src,
+        )
+        .unwrap();
+        assert!(
+            doc_for(&pf, "Sender").contains("payload"),
+            "class doc: {:?}",
+            doc_for(&pf, "Sender")
+        );
+        assert!(
+            doc_for(&pf, "score").contains("Computes"),
+            "fn doc: {:?}",
+            doc_for(&pf, "score")
+        );
+    }
+
+    /// The climb out of a wrapper must not reach across unrelated code: a
+    /// comment above an enclosing function does not document what is inside it.
+    #[test]
+    fn a_comment_is_not_stolen_from_an_enclosing_block() {
+        let src = "/// Documents the outer function only.\n\
+                   fn outer() {\n\
+                       fn inner() -> i32 { 1 }\n\
+                   }\n";
+        let pf = parse(&rust_config(), "n.rs", src).unwrap();
+        assert!(doc_for(&pf, "outer").contains("outer function"));
+        assert_eq!(doc_for(&pf, "inner"), "", "inner must have no doc");
+    }
+
+    /// CSS and HTML have no type system; the query is absent, not empty.
+    #[test]
+    fn languages_without_types_emit_none() {
+        let pf = parse(&css_config(), "a.css", ".card { color: red }\n").unwrap();
+        assert!(type_names(&pf).is_empty());
     }
 }

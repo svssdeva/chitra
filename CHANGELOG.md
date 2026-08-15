@@ -14,6 +14,17 @@ All notable changes to this project are documented here. The format follows
 - **Confidence tiers.** Every edge is `EXTRACTED`, `INFERRED`, or `AMBIGUOUS`.
   Ambiguous edges are surfaced but excluded from impact analysis and from the
   visualization.
+- **Type nodes and the foreign-type guard.** Type declarations are parsed so that
+  a qualified call (`Foo::new()`) can be resolved against the files holding that
+  type's code — and so that a call through a type defined *outside* the
+  repository (`Box::new`, `JSON.parse`) resolves to nothing instead of guessing.
+  On a 7,000-file monorepo this removed 24,142 phantom edges, 60% of all
+  ambiguity, taking the confidently-resolved share from 10.7% to 23.2% with gold
+  precision held at 1.000.
+- **Doc-comment search.** The comment above a declaration — or a Python
+  docstring — is indexed alongside names and signatures, so a symbol can be
+  found by what it says it does rather than only by what it is called. Bodies
+  are never indexed, and docs never affect resolution.
 - **Incremental updates.** blake3 hash-gated `update`, with per-file atomic
   replacement. A no-op update is sub-second.
 - **Deterministic export.** `graph.json` is byte-identical across Linux, macOS,

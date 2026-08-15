@@ -79,10 +79,12 @@ JSON-RPC 2.0 over stdio, protocol version `2024-11-05`. Seven tools:
 handle sign-in?" — has no way in without it. It returns qualified names, which
 are exactly what the other tools want.
 
-It searches **names and signatures**, never function bodies or comments. On an
-`embeddings` build it uses the same hybrid channels as `chitra search --hybrid`
-and reports `"mode": "hybrid"`; otherwise `"mode": "fts"`. Either way, it finds
-what your code *names*, so it works best when your naming is honest.
+It searches **names, signatures, and doc comments** — never function bodies. The
+doc channel is what lets a description find a symbol whose name shares no word
+with it: `"extended-length path"` finds `plain`, because that is what its doc
+comment says it strips. On an `embeddings` build it uses the same hybrid
+channels as `chitra search --hybrid` and reports `"mode": "hybrid"`; otherwise
+`"mode": "fts"`.
 
 Every response carries `_meta.token_estimate` — a cl100k estimate, labelled as
 an estimate, so an assistant can budget before it spends.

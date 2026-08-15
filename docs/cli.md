@@ -52,7 +52,12 @@ than everything that might conceivably be related.
 
 ### `chitra search <query> [--limit <n>] [--hybrid]`
 
-Full-text search over symbol names and signatures. Default limit 20.
+Full-text search over symbol names, signatures, and doc comments. Default limit
+20.
+
+The doc-comment channel is the one that finds symbols by intent rather than by
+name — a Rust `///` block, a Python docstring, a JSDoc or Go comment above the
+declaration. Bodies are never indexed.
 
 `--hybrid` additionally fuses two local channels — character trigrams for typos,
 and graph-context expansion so a symbol can be found by the names of its
