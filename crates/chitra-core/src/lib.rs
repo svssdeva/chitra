@@ -23,7 +23,7 @@ pub use review::{
     changes_markdown, detect_changes, estimate_files, estimate_tokens, minimal_context,
     review_context, risk, risk_v2, top_risks, Detail, Risk, RiskV2,
 };
-pub use store::{FlowRow, Store};
+pub use store::{FlowRow, Store, SymbolMatch};
 pub use structure::architecture;
 pub use viz::{visualize_html, Mode as VizMode};
 pub use watch::{tick, watch_loop, WatchRoot, DEFAULT_INTERVAL_MS};
