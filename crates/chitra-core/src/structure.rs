@@ -36,6 +36,82 @@ fn undirected_adjacency(store: &Store) -> Result<HashMap<String, Vec<String>>> {
     Ok(adj)
 }
 
+/// Name a community after *where it lives*.
+///
+/// The label used to be the lexicographically smallest member, so an overview
+/// meant to orient a reviewer read
+/// `apps/grind/src/styles/global.css::--font-mono` — a raw qualified name that
+/// says nothing about the group. The directory the members share is both
+/// meaningful and free.
+///
+/// Deterministic by construction: a common prefix, then a frequency count with
+/// a lexicographic tie-break over distinct keys, so HashMap iteration order
+/// cannot change the answer. (Labels do not reach `graph.json` — only community
+/// *ids* are exported — so this is not what the RISK-4 byte-identical gate
+/// rests on. It still has to be stable for `communities` and `architecture`.)
+fn label_for(members: &[String]) -> String {
+    if members.is_empty() {
+        return "(empty)".to_string();
+    }
+    // `file::symbol` → `file`; a `<file>` node has no symbol half.
+    let files: Vec<&str> = members
+        .iter()
+        .map(|m| m.split("::").next().unwrap_or(m.as_str()))
+        .collect();
+
+    // When every member lives in one file, name the file. Falling straight to
+    // the directory threw away the only discriminator available: several
+    // independent clusters inside one directory all came back labelled
+    // `src/lib`, and the old label was unique by construction.
+    if files.iter().all(|f| *f == files[0]) {
+        return files[0].to_string();
+    }
+
+    let dirs: Vec<&str> = files
+        .iter()
+        .map(|f| match f.rfind('/') {
+            Some(i) => &f[..i],
+            None => "",
+        })
+        .collect();
+
+    // Longest common directory prefix, compared per path component so that
+    // `apps/main` and `apps/mainframe` share `apps`, not `apps/main`.
+    let mut common: Vec<&str> = dirs[0].split('/').filter(|s| !s.is_empty()).collect();
+    for d in &dirs[1..] {
+        let parts: Vec<&str> = d.split('/').filter(|s| !s.is_empty()).collect();
+        let keep = common
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(keep);
+        if common.is_empty() {
+            break;
+        }
+    }
+    if !common.is_empty() {
+        return common.join("/");
+    }
+
+    // Members span unrelated trees: name it after the directory most of them
+    // are in, so the label still points somewhere real.
+    let mut tally: HashMap<&str, usize> = HashMap::new();
+    for d in &dirs {
+        *tally.entry(*d).or_insert(0) += 1;
+    }
+    let best = tally
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(d, _)| d)
+        .unwrap_or("");
+    if best.is_empty() {
+        "(repository root)".to_string()
+    } else {
+        best.to_string()
+    }
+}
+
 /// Deterministic label propagation → community assignment. Singleton/isolated
 /// nodes get no community (NULL); communities are groups of size ≥ 2.
 fn detect_communities(store: &mut Store) -> Result<()> {
@@ -94,9 +170,23 @@ fn detect_communities(store: &mut Store) -> Result<()> {
 
     let mut assignments: Vec<(String, i64)> = Vec::new();
     let mut communities: Vec<(i64, i64, String)> = Vec::new();
+    // Two unrelated clusters can genuinely share a directory, so a directory
+    // label is not unique the way the old smallest-member label was. Suffixing
+    // the id restores that guarantee — an overview served to an assistant with
+    // three entries called `apps` is worse than a slightly longer name.
+    let mut label_counts: HashMap<String, usize> = HashMap::new();
+    for members in kept.iter() {
+        *label_counts.entry(label_for(members)).or_insert(0) += 1;
+    }
     for (id, members) in kept.iter().enumerate() {
         let id = id as i64;
-        communities.push((id, members.len() as i64, members[0].clone())); // label = smallest member
+        let base = label_for(members);
+        let label = if label_counts.get(&base).copied().unwrap_or(0) > 1 {
+            format!("{base} #{id}")
+        } else {
+            base
+        };
+        communities.push((id, members.len() as i64, label));
         for m in members {
             assignments.push((m.clone(), id));
         }
@@ -286,6 +376,104 @@ mod tests {
         assert!((flows[0].criticality - 1.0).abs() < 1e-9);
         let members = store.flow_members(flows[0].id).unwrap();
         assert!(members.contains(&"m.rs::step2".to_string()));
+    }
+
+    /// An architecture overview exists to orient someone. Naming a community
+    /// after its lexicographically smallest member printed things like
+    /// `apps/grind/src/styles/global.css::--font-mono`, which orients nobody.
+    #[test]
+    fn community_labels_name_a_directory_not_a_member() {
+        // All in one directory -> that directory.
+        assert_eq!(
+            label_for(&[
+                "apps/main/src/lib/chess/engine.ts::applyMove".to_string(),
+                "apps/main/src/lib/chess/ai.ts::minimax".to_string(),
+            ]),
+            "apps/main/src/lib/chess"
+        );
+        // Nested under a shared parent -> the shared parent, compared per
+        // component so a common *prefix* of two names never merges them.
+        assert_eq!(
+            label_for(&[
+                "apps/main/a.ts::f".to_string(),
+                "apps/mainframe/b.ts::g".to_string(),
+            ]),
+            "apps"
+        );
+        // No shared prefix -> the directory most members live in.
+        assert_eq!(
+            label_for(&[
+                "services/api/a.rs::f".to_string(),
+                "services/api/b.rs::g".to_string(),
+                "web/c.ts::h".to_string(),
+            ]),
+            "services/api"
+        );
+        // A file node carries no `::symbol` half and must not panic.
+        assert_eq!(
+            label_for(&["pages/index.astro::<file>".to_string()]),
+            "pages/index.astro"
+        );
+        // Root-level files spanning more than one file still get a label.
+        assert_eq!(
+            label_for(&["a.ts::f".to_string(), "b.ts::g".to_string()]),
+            "(repository root)"
+        );
+        // Never panics on an empty group.
+        assert_eq!(label_for(&[]), "(empty)");
+    }
+
+    /// Labels used to be unique by construction (the smallest member). Naming
+    /// by directory alone collapsed several independent clusters in one
+    /// directory onto one label, leaving only the numeric id to tell them
+    /// apart — in output served to an assistant.
+    #[test]
+    fn community_labels_keep_clusters_distinguishable() {
+        let one = label_for(&[
+            "src/lib/one.rs::a".to_string(),
+            "src/lib/one.rs::b".to_string(),
+        ]);
+        let two = label_for(&[
+            "src/lib/two.rs::a".to_string(),
+            "src/lib/two.rs::b".to_string(),
+        ]);
+        assert_eq!(one, "src/lib/one.rs");
+        assert_eq!(two, "src/lib/two.rs");
+        assert_ne!(one, two, "same-directory clusters must not share a label");
+
+        // Root-level, single file each.
+        assert_eq!(
+            label_for(&["one.rs::a".to_string(), "one.rs::b".to_string()]),
+            "one.rs"
+        );
+    }
+
+    /// Every community must be nameable on sight. Two clusters in one
+    /// directory legitimately share a directory label, so the id disambiguates.
+    #[test]
+    fn community_labels_are_unique() {
+        // Three disjoint clusters that all resolve to the same base label.
+        let (store, _d) = build(
+            "labeluniq",
+            &[
+                ("one.rs", "fn a1() { a2(); }\nfn a2() { a1(); }\n"),
+                ("two.rs", "fn b1() { b2(); }\nfn b2() { b1(); }\n"),
+                ("three.rs", "fn c1() { c2(); }\nfn c2() { c1(); }\n"),
+            ],
+        );
+        let labels: Vec<String> = store
+            .communities()
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, l)| l)
+            .collect();
+        assert!(labels.len() >= 3, "got {labels:?}");
+        let mut uniq = labels.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), labels.len(), "labels collide: {labels:?}");
+        // And they still name a real location.
+        assert!(labels.iter().all(|l| l.contains(".rs")), "{labels:?}");
     }
 
     #[test]

@@ -52,6 +52,18 @@ pub fn update(store: &mut Store, root: &Path) -> Result<Stats> {
 fn sync(store: &mut Store, root: &Path, full: bool) -> Result<Stats> {
     let registry = Registry::load(root); // built-ins + any languages.toml (T4.4)
     let files = collect(root)?;
+    // An empty walk is reported, never silent. The most likely cause is now
+    // the nested-repo rule: pointed at a *workspace* holding several checkouts,
+    // every subdirectory owns its own `.git` and the whole tree is skipped,
+    // which would otherwise print `0 nodes, 0 edges` as if the code were gone.
+    if files.is_empty() {
+        eprintln!(
+            "warn: no indexable files under {} — every subdirectory may be a \
+             separate git repository (chitra indexes one repo at a time), or \
+             .gitignore/.chitraignore may exclude everything",
+            root.display()
+        );
+    }
 
     // Parse in parallel: read -> blake3 -> tree-sitter. Non-fatal per file.
     let parsed: Vec<(String, String, String, ParsedFile)> = files
@@ -483,8 +495,19 @@ fn collect(root: &Path) -> Result<Vec<(PathBuf, String, String)>> {
         .follow_links(false) // loops, escapes
         .add_custom_ignore_filename(".chitraignore")
         .filter_entry(|e| {
-            !e.file_type().is_some_and(|t| t.is_dir())
-                || !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
+            if !e.file_type().is_some_and(|t| t.is_dir()) {
+                return true;
+            }
+            if SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()) {
+                return false;
+            }
+            // A nested `.git` means a different repository owns these files:
+            // a submodule (where `.git` is a file) or a plain nested clone
+            // (where it is a directory). `git ls-files` reports a submodule as
+            // a single gitlink, never its contents, and indexing them anyway
+            // duplicates third-party symbols into our graph. Depth 0 is the
+            // scan root, whose own `.git` is precisely the repo we want.
+            e.depth() == 0 || !e.path().join(".git").exists()
         })
         .build();
 
@@ -901,6 +924,71 @@ fn new() -> i32 { 1 }
             .get_node("node_modules/pkg/i.js::dep")
             .unwrap()
             .is_none());
+    }
+
+    /// A git submodule is a *separate repository*: `git ls-files` reports it as
+    /// one gitlink entry (mode 160000), not as its contents. Walking into it
+    /// indexes third-party source as if it were ours — measured on a real Astro
+    /// monorepo, 59 vendored files, and the largest "community" in the
+    /// architecture overview was named after one of them.
+    ///
+    /// The marker is a nested `.git`, which is a *file* in a submodule checkout
+    /// and a *directory* in a plain nested clone. Both mean the same thing:
+    /// those files belong to another repository.
+    #[test]
+    fn nested_git_repositories_are_not_indexed() {
+        let dir = fresh("chitra_ignore_submodule");
+        write(&dir, "app.js", "function real() { return 1; }\n");
+
+        // A submodule checkout: `.git` is a file pointing at the parent's
+        // .git/modules/<name>.
+        std::fs::create_dir_all(dir.join("vendored")).unwrap();
+        std::fs::write(
+            dir.join("vendored/.git"),
+            "gitdir: ../.git/modules/vendored\n",
+        )
+        .unwrap();
+        write(&dir, "vendored/lib.js", "function theirs() { return 1; }\n");
+
+        // A plain nested clone: `.git` is a directory.
+        std::fs::create_dir_all(dir.join("nested/.git")).unwrap();
+        write(
+            &dir,
+            "nested/lib.js",
+            "function alsoTheirs() { return 1; }\n",
+        );
+
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+
+        assert!(store.get_node("app.js::real").unwrap().is_some());
+        assert!(
+            store.get_node("vendored/lib.js::theirs").unwrap().is_none(),
+            "a git submodule must not be indexed"
+        );
+        assert!(
+            store
+                .get_node("nested/lib.js::alsoTheirs")
+                .unwrap()
+                .is_none(),
+            "a nested git clone must not be indexed"
+        );
+    }
+
+    /// The root of the scan always has a `.git` of its own — skipping any
+    /// directory with one would index nothing at all.
+    #[test]
+    fn the_repository_root_is_still_indexed_when_it_has_a_git_dir() {
+        let dir = fresh("chitra_ignore_root_git");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        write(&dir, "app.js", "function real() { return 1; }\n");
+
+        let mut store = Store::open_in_memory().unwrap();
+        build(&mut store, &dir).unwrap();
+        assert!(
+            store.get_node("app.js::real").unwrap().is_some(),
+            "the scanned repo's own .git must not exclude the repo"
+        );
     }
 
     /// Node identity must be `/`-separated on every platform — this is what the

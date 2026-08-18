@@ -20,6 +20,23 @@ fn positional(args: &[String]) -> Option<&str> {
         .filter(|a| !a.starts_with("--"))
 }
 
+/// Accept a bare symbol name wherever a qualified one is expected.
+///
+/// Nobody types `apps/main/src/data/github.ts::enrichProjects` from memory, and
+/// the graph already knows whether the short form is unambiguous. Ambiguity
+/// lists the candidates instead of guessing one.
+fn resolve_symbol(store: &chitra_core::Store, sym: &str) -> Result<String> {
+    match store.resolve_symbol(sym)? {
+        chitra_core::SymbolMatch::Exact(qn) => Ok(qn),
+        chitra_core::SymbolMatch::None => bail!("no such symbol: {sym}"),
+        chitra_core::SymbolMatch::Ambiguous(hits) => bail!(
+            "`{sym}` matches {} symbols; qualify it:\n  {}",
+            hits.len(),
+            hits.join("\n  ")
+        ),
+    }
+}
+
 fn ensure_parent(db: &str) -> Result<()> {
     if let Some(parent) = Path::new(db).parent() {
         if !parent.as_os_str().is_empty() {
@@ -39,6 +56,12 @@ fn main() -> Result<()> {
         Some("build") | Some("update") => {
             let full = args[1] == "build";
             let dir = positional(&args).unwrap_or(".");
+            // Without this, a typo or an unrecognised single-dash flag is read
+            // as the directory and the build "succeeds" over zero files —
+            // reporting `0 nodes, 0 edges` as if the repository were empty.
+            if !Path::new(dir).is_dir() {
+                bail!("not a directory: {dir}");
+            }
             ensure_parent(&db)?;
             let mut store = chitra_core::Store::open(&db)?;
             let s = if full {
@@ -63,6 +86,7 @@ fn main() -> Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3);
             let store = chitra_core::Store::open(&db)?;
+            let sym = &resolve_symbol(&store, sym)?;
             let deps = store.impact(sym, depth)?;
             if deps.is_empty() {
                 println!("no dependents of {sym} within depth {depth}");
@@ -83,6 +107,10 @@ fn main() -> Result<()> {
                 );
             };
             let store = chitra_core::Store::open(&db)?;
+            // Same bare-name resolution as risk/impact/review: accepting a name
+            // in one command and reporting "no results" for it in the next is a
+            // false negative at exit 0.
+            let sym = &resolve_symbol(&store, sym)?;
             let out = match pattern {
                 "callers_of" => store.callers_of(sym)?,
                 "callees_of" => store.callees_of(sym)?,
@@ -139,11 +167,21 @@ fn main() -> Result<()> {
                 bail!("usage: chitra risk <symbol> [--db <path>]");
             };
             let store = chitra_core::Store::open(&db)?;
+            let sym = &resolve_symbol(&store, sym)?;
             match chitra_core::risk(&store, sym)? {
                 None => bail!("no such symbol: {sym}"),
                 Some(r) => println!(
                     "risk v1 {:.2}  (fan_in={}, has_tests={}, ambiguous_density={:.2})  {sym}",
-                    r.score, r.fan_in, r.has_tests, r.ambiguous_density
+                    r.score,
+                    r.fan_in,
+                    // Say so when the term was not applied, or the printed
+                    // numbers do not reconstruct the printed score.
+                    if r.test_gap_applies {
+                        r.has_tests.to_string()
+                    } else {
+                        "n/a (kind cannot be tested)".to_string()
+                    },
+                    r.ambiguous_density
                 ),
             }
             if let Some(v) = chitra_core::risk_v2(&store, sym)? {
@@ -208,6 +246,7 @@ fn main() -> Result<()> {
             };
             let detail = chitra_core::Detail::parse(flag(&args, "--detail").unwrap_or("minimal"));
             let store = chitra_core::Store::open(&db)?;
+            let sym = &resolve_symbol(&store, sym)?;
             let ctx = chitra_core::review_context(&store, sym, detail)?;
             println!("{}", serde_json::to_string_pretty(&ctx)?);
         }

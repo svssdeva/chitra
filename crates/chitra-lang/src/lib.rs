@@ -98,6 +98,21 @@ pub struct LanguageConfig {
     pub import_query: Option<String>,
     /// Name prefixes that mark a symbol as a test (in addition to path heuristics).
     pub test_prefixes: Vec<String>,
+    /// Extra definition patterns applied **only to files the path marks as
+    /// tests**. A test case declares no function, so without this a test file
+    /// yields no nodes; running it everywhere instead would mint nodes inside
+    /// ordinary functions and steal their call attribution.
+    pub test_function_query: Option<String>,
+    /// Attributes/decorators that mark a definition — or any scope enclosing it —
+    /// as test code. Rust's dominant idiom puts tests *beside* the code they
+    /// cover (`#[cfg(test)] mod tests`), so neither the path nor the name says
+    /// "test" and both other heuristics miss it entirely.
+    ///
+    /// A pattern matches an attribute whose inner text is exactly the pattern,
+    /// or is path-qualified with it (`test` matches `#[tokio::test]`). Matching
+    /// the whole token rather than a substring is what keeps `#[cfg(not(test))]`
+    /// — which marks the opposite — from reading as a test.
+    pub test_attributes: Vec<String>,
     /// Split one captured callee into several on this character. HTML's
     /// `class="card title"` is two references, not one symbol named "card title".
     pub callee_separator: Option<char>,
@@ -112,9 +127,21 @@ pub struct LanguageConfig {
     /// Emit a `<file>` node so references written outside any definition still
     /// have a source. HTML markup is not inside a function.
     pub emit_file_node: bool,
+    /// What this language's definitions *are*. Defaults to `Function` because
+    /// most are, but a CSS class selector is not a function and typing it as
+    /// one is not cosmetic: on a real site 2,910 of 5,658 nodes were selectors
+    /// filed as functions, which is what put stylesheets at the top of a
+    /// change-risk ranking meant to surface code.
+    pub def_kind: String,
     /// The doc comment lives *inside* the definition as its first statement (a
     /// Python docstring) rather than in comments above it.
     pub doc_in_body: bool,
+    /// Rewrite the source before parsing, for a file format that *embeds* a
+    /// supported language rather than being one (an `.astro` component around
+    /// TypeScript). A filter must preserve line numbering — see
+    /// [`astro_to_ts`]. Not settable from `languages.toml`: it is code, and a
+    /// config file may not introduce code.
+    pub source_filter: Option<fn(&str) -> String>,
 }
 
 impl LanguageConfig {
@@ -135,12 +162,16 @@ impl LanguageConfig {
             call_query: call_query.to_string(),
             import_query: None,
             test_prefixes: Vec::new(),
+            test_function_query: None,
+            test_attributes: Vec::new(),
             callee_separator: None,
             resolve_languages: vec![language.to_string()],
             merge_duplicate_defs: false,
             emit_file_node: false,
+            def_kind: "Function".to_string(),
             type_query: None,
             doc_in_body: false,
+            source_filter: None,
         }
     }
 }
@@ -177,6 +208,10 @@ pub fn rust_config() -> LanguageConfig {
              (use_declaration argument: (scoped_use_list path: (_) @module list: (use_list (identifier) @import)))"
                 .to_string(),
         ),
+        // Rust puts tests beside the code they cover, so `path_is_test` never
+        // fires for the dominant idiom: `#[cfg(test)] mod tests` inside an
+        // ordinary `src/*.rs`. `test` also covers `#[tokio::test]` and friends.
+        test_attributes: strs(&["test", "cfg(test)", "rstest", "proptest"]),
         ..LanguageConfig::new(
             "rust",
             &["rs"],
@@ -256,6 +291,24 @@ fn ts_config_for(extensions: &[&str], grammar: LanguageFn) -> LanguageConfig {
             "(import_statement (import_clause (named_imports (import_specifier name: (identifier) @import))) source: (string) @module)"
                 .to_string(),
         ),
+        // A test case is a definition too. `test("…", () => {})` declares
+        // nothing, so a test file parsed to zero nodes and no TESTED_BY edge
+        // could exist. This runs *only* in files the path marks as tests:
+        // `it("x", …)` inside an ordinary function would otherwise mint a node
+        // whose byte range steals call attribution from the real enclosing
+        // function, silently deleting edges from the graph.
+        //
+        // `@name` captures the whole `(string)` rather than a `string_fragment`
+        // — the grammar splits a literal at every escape, so
+        // `test("returns \"ok\" now")` produced three nodes with mangled names.
+        // The `.` anchor pins it to the *first* argument.
+        test_function_query: Some(
+            "((call_expression\n\
+                 function: (identifier) @_tfn\n\
+                 arguments: (arguments . (string) @name)) @def\n\
+              (#match? @_tfn \"^(test|it|bench)$\"))"
+                .to_string(),
+        ),
         ..LanguageConfig::new(
             "typescript",
             extensions,
@@ -288,6 +341,8 @@ pub fn css_config() -> LanguageConfig {
     LanguageConfig {
         // A class styled in three places is one class.
         merge_duplicate_defs: true,
+        // A selector is a styling hook, not a callable.
+        def_kind: "Selector".to_string(),
         ..LanguageConfig::new(
             "css",
             &["css", "scss"],
@@ -318,6 +373,8 @@ pub fn html_config() -> LanguageConfig {
         callee_separator: Some(' '), // class="card title" is two references
         resolve_languages: strs(&["css", "html"]),
         emit_file_node: true, // markup lives outside any definition
+        // An `id=` is a link target in the document, not a callable.
+        def_kind: "Anchor".to_string(),
         ..LanguageConfig::new(
             "html",
             &["html", "htm"],
@@ -325,6 +382,235 @@ pub fn html_config() -> LanguageConfig {
             "((element (start_tag (attribute (attribute_name) @an (quoted_attribute_value (attribute_value) @name)))) @def (#eq? @an \"id\"))",
             "((attribute (attribute_name) @an (quoted_attribute_value (attribute_value) @callee)) (#eq? @an \"class\"))",
         )
+    }
+}
+
+/// Rewrite an `.astro` single-file component into the TypeScript subset of
+/// itself, **preserving line numbering exactly** so every reported line still
+/// points at the right line of the original file.
+///
+/// Astro has no first-class grammar here. Rather than link one, the parts that
+/// *are* TypeScript — the `---` frontmatter fence and any `<script>` block —
+/// are kept and everything else is replaced by a blank line of the same index.
+/// The frontmatter is where an Astro page does its work: imports, data
+/// fetching, and the calls into shared code that a reviewer needs to see.
+///
+/// Ceiling: expressions embedded in markup (`{items.map(render)}`) and
+/// component usage (`<Card />`) are blanked with the rest of the template, so
+/// calls written *only* there are not edges. The imports that introduce those
+/// components are still captured, which is what resolution runs on. Lift this
+/// by linking a real Astro grammar if markup-level calls start mattering.
+/// Does this line open a `<script>` block whose body is executable code?
+///
+/// Being wrong here is expensive in one direction: treating a data or
+/// templated block as code hands tree-sitter a page of markup and loses the
+/// whole file to a parse error. So this is deliberately conservative and only
+/// accepts a complete, plain opening tag on one line.
+///
+/// Rejected, each seen in real Astro pages:
+/// - `<script type="application/ld+json">` — JSON-LD, structured data
+/// - `<script set:html={JSON.stringify(...)}>` — body injected, not written here
+/// - `<script is:inline type="..."` continued on the next line — an incomplete
+///   tag, where the body does not start on this line at all
+fn opens_code_script(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix("<script") else {
+        return false;
+    };
+    // Tag-name boundary. `<script-loader>` is a different element, and without
+    // this check the shim entered a script block that never closed and handed
+    // the whole remaining template to the TypeScript parser.
+    if !rest.is_empty() && !rest.starts_with([' ', '\t', '>', '/']) {
+        return false;
+    }
+    if t.contains("/>") || closes_script(t) {
+        return false;
+    }
+    // The opening tag must finish on this line, or we cannot know where the
+    // body begins.
+    if !t.contains('>') {
+        return false;
+    }
+    script_body_is_code(t)
+}
+
+/// Does this line close a script block? `</script >` is legal HTML.
+fn closes_script(t: &str) -> bool {
+    match t.find("</script") {
+        None => false,
+        Some(i) => t[i + "</script".len()..].trim_start().starts_with('>'),
+    }
+}
+
+/// Shared attribute test: is the body of this `<script …>` executable code?
+fn script_body_is_code(t: &str) -> bool {
+    // `set:html` fills the body from an expression; the text is not source.
+    if t.contains("set:html") {
+        return false;
+    }
+    // A `type` other than a JavaScript one means the body is data.
+    match t.split("type=").nth(1) {
+        None => true,
+        Some(rest) => {
+            let v = rest
+                .trim_start()
+                .trim_start_matches(['"', '\''])
+                .split(['"', '\'', ' ', '>'])
+                .next()
+                .unwrap_or("");
+            v.is_empty() || v == "module" || v == "text/javascript" || v == "application/javascript"
+        }
+    }
+}
+
+/// `<script>init()</script>` written on one line — returns just the body, which
+/// otherwise gets blanked along with the markup.
+fn inline_script_body(t: &str) -> Option<&str> {
+    let rest = t.strip_prefix("<script")?;
+    if !rest.is_empty() && !rest.starts_with([' ', '\t', '>', '/']) {
+        return None;
+    }
+    if t.contains("/>") || !script_body_is_code(t) {
+        return None;
+    }
+    let open_end = t.find('>')?;
+    let close = t.find("</script")?;
+    if close < open_end {
+        return None;
+    }
+    Some(&t[open_end + 1..close])
+}
+
+/// Track the TypeScript lexical state that can hide a `---` from the fence
+/// detector: template literals and block comments both span lines, and a
+/// frontmatter block that builds a Markdown string contains `---` legitimately.
+/// Closing the fence there dropped the rest of the frontmatter and left an
+/// unterminated literal, losing every symbol in the file.
+fn track_ts_state(line: &str, in_template: &mut bool, in_block_comment: &mut bool) {
+    let c: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    // Ordinary quotes cannot span lines, so this resets each call.
+    let mut quote: Option<char> = None;
+    while i < c.len() {
+        let ch = c[i];
+        if *in_block_comment {
+            if ch == '*' && c.get(i + 1) == Some(&'/') {
+                *in_block_comment = false;
+                i += 2;
+                continue;
+            }
+        } else if let Some(q) = quote {
+            if ch == '\\' {
+                i += 2;
+                continue;
+            }
+            if ch == q {
+                quote = None;
+            }
+        } else if *in_template {
+            if ch == '\\' {
+                i += 2;
+                continue;
+            }
+            if ch == '`' {
+                *in_template = false;
+            }
+        } else {
+            match ch {
+                '/' if c.get(i + 1) == Some(&'/') => return, // line comment
+                '/' if c.get(i + 1) == Some(&'*') => {
+                    *in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+                '`' => *in_template = true,
+                '\'' | '"' => quote = Some(ch),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+}
+
+fn astro_to_ts(source: &str) -> String {
+    enum Zone {
+        /// Before anything meaningful — a leading `---` opens frontmatter.
+        Pre,
+        Frontmatter,
+        Markup,
+        Script,
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut zone = Zone::Pre;
+    let mut in_template = false;
+    let mut in_block_comment = false;
+    for (i, raw) in source.lines().enumerate() {
+        // A UTF-8 BOM is not whitespace, so without stripping it the opening
+        // fence never matches `---` and the entire file reads as markup —
+        // silently, with no parse warning. BOMs are routine on Windows.
+        let line = if i == 0 {
+            raw.trim_start_matches('\u{feff}')
+        } else {
+            raw
+        };
+        let t = line.trim();
+        let mut keep = false;
+        let mut inline: Option<&str> = None;
+        match zone {
+            Zone::Pre => {
+                if t == "---" {
+                    zone = Zone::Frontmatter;
+                } else if !t.is_empty() {
+                    zone = Zone::Markup;
+                }
+            }
+            Zone::Frontmatter => {
+                // The fence only closes in plain code, never inside a template
+                // literal or block comment that happens to contain `---`.
+                if t == "---" && !in_template && !in_block_comment {
+                    zone = Zone::Markup;
+                } else {
+                    keep = true;
+                    track_ts_state(line, &mut in_template, &mut in_block_comment);
+                }
+            }
+            Zone::Markup => {}
+            Zone::Script => {
+                if closes_script(t) {
+                    zone = Zone::Markup;
+                } else {
+                    keep = true;
+                }
+            }
+        }
+        if matches!(zone, Zone::Markup) {
+            if opens_code_script(t) {
+                zone = Zone::Script;
+            } else {
+                inline = inline_script_body(t);
+            }
+        }
+        match inline {
+            Some(body) => out.push_str(body),
+            None if keep => out.push_str(line),
+            None => {}
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Astro pages, parsed as the TypeScript they mostly are (see [`astro_to_ts`]).
+pub fn astro_config() -> LanguageConfig {
+    LanguageConfig {
+        language: "astro".to_string(),
+        // Frontmatter runs at the top level of the module, so its calls have no
+        // enclosing function to attribute to — without a file node they would
+        // have no source and be dropped.
+        emit_file_node: true,
+        // The entire point: an Astro page calls into shared `.ts` modules.
+        resolve_languages: strs(&["astro", "typescript"]),
+        source_filter: Some(astro_to_ts),
+        ..ts_config_for(&["astro"], tree_sitter_typescript::LANGUAGE_TYPESCRIPT)
     }
 }
 
@@ -339,6 +625,7 @@ pub fn config_for_extension(ext: &str) -> Option<LanguageConfig> {
         "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(tsx_config()),
         "css" | "scss" => Some(css_config()),
         "html" | "htm" => Some(html_config()),
+        "astro" => Some(astro_config()),
         _ => None,
     }
 }
@@ -362,7 +649,7 @@ pub fn grammar_by_name(name: &str) -> Option<LanguageFn> {
 /// Extensions the built-in configs own. A `languages.toml` entry may never
 /// claim one of these — built-ins are protected (T4.4).
 const BUILTIN_EXTENSIONS: &[&str] = &[
-    "rs", "py", "go", "ts", "tsx", "js", "jsx", "mjs", "cjs", "css", "scss", "html", "htm",
+    "rs", "py", "go", "ts", "tsx", "js", "jsx", "mjs", "cjs", "css", "scss", "html", "htm", "astro",
 ];
 
 /// Cap on user-defined languages. Each one compiles two tree-sitter queries per
@@ -526,6 +813,11 @@ fn language_from_toml(entry: &toml::Value) -> Result<LanguageConfig> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         test_prefixes: get_list("test_prefixes"),
+        test_function_query: entry
+            .get("test_function_query")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        test_attributes: get_list("test_attributes"),
         callee_separator: entry
             .get("callee_separator")
             .and_then(|v| v.as_str())
@@ -539,10 +831,18 @@ fn language_from_toml(entry: &toml::Value) -> Result<LanguageConfig> {
             .get("emit_file_node")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        def_kind: entry
+            .get("def_kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Function")
+            .to_string(),
         doc_in_body: entry
             .get("doc_in_body")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        // Deliberately not configurable: a source filter is code, and
+        // `languages.toml` is data read from the scanned repo.
+        source_filter: None,
     };
     // Compile the queries now: a typo caught here is one warning, not one per
     // file parsed.
@@ -640,6 +940,12 @@ pub fn parse(cfg: &LanguageConfig, file: &str, source: &str) -> Result<ParsedFil
     let language: Language = cfg.grammar.into();
     let mut parser = Parser::new();
     parser.set_language(&language)?;
+    // A wrapper format (`.astro`) is reduced to the language it embeds first.
+    // The filter preserves line numbering, so everything downstream — line
+    // numbers, signatures, byte-containment scoping — reads the same as if the
+    // file had been written in that language.
+    let filtered = cfg.source_filter.map(|f| f(source));
+    let source: &str = filtered.as_deref().unwrap_or(source);
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter failed to parse {file}"))?;
@@ -671,7 +977,12 @@ pub fn parse(cfg: &LanguageConfig, file: &str, source: &str) -> Result<ParsedFil
         });
     }
 
-    let fq = Query::new(&language, &cfg.function_query)?;
+    // Test-case patterns are only in play for a file the path marks as a test.
+    let fq_src = match (&cfg.test_function_query, file_is_test) {
+        (Some(extra), true) => format!("{}\n{}", cfg.function_query, extra),
+        _ => cfg.function_query.clone(),
+    };
+    let fq = Query::new(&language, &fq_src)?;
     let f_name = fq
         .capture_index_for_name("name")
         .context("function_query missing @name capture")?;
@@ -693,6 +1004,9 @@ pub fn parse(cfg: &LanguageConfig, file: &str, source: &str) -> Result<ParsedFil
         let (Some(name), Some(dn)) = (name, def_node) else {
             continue;
         };
+        // A test case's name is a string literal, so the capture carries its
+        // quotes. Identifiers never do, so this is a no-op everywhere else.
+        let name = strip_quotes(&name).to_string();
         let (s, e) = (dn.start_position().row, dn.end_position().row);
         // Collision policy (data model): later same-name symbols get `#L<line>`,
         // unless the language says repeats are the same thing (CSS selectors).
@@ -714,10 +1028,15 @@ pub fn parse(cfg: &LanguageConfig, file: &str, source: &str) -> Result<ParsedFil
             || cfg
                 .test_prefixes
                 .iter()
-                .any(|p| name.starts_with(p.as_str()));
+                .any(|p| name.starts_with(p.as_str()))
+            || has_test_attribute(dn, bytes, &cfg.test_attributes);
         nodes.push(Node {
             qualified_name: qn,
-            kind: if is_test { "Test" } else { "Function" }.to_string(),
+            kind: if is_test {
+                "Test".to_string()
+            } else {
+                cfg.def_kind.clone()
+            },
             name,
             file: file.to_string(),
             line_start: s + 1,
@@ -1042,13 +1361,96 @@ fn is_decoration(kind: &str) -> bool {
 }
 
 /// Path-based test heuristic (covers frameworks that don't use a name prefix).
+/// Does `attr` — the raw source of one attribute/decorator — name a test?
+///
+/// The inner text is taken between the outermost brackets and stripped of
+/// whitespace, so `#[ tokio :: test ]` and `#[tokio::test]` compare equal. A
+/// pattern matches the whole token or a path-qualified form of it; substring
+/// matching would make `#[cfg(not(test))]` a test marker.
+fn attribute_names_test(attr: &str, patterns: &[String]) -> bool {
+    let inner: String = attr
+        .trim()
+        .trim_start_matches("#![")
+        .trim_start_matches("#[")
+        .trim_end_matches(']')
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    // A decorator has no brackets to strip; `@pytest.fixture` arrives as-is.
+    let inner = inner.trim_start_matches('@');
+    patterns.iter().any(|p| {
+        inner == p.as_str()
+            || inner.ends_with(&format!("::{p}"))
+            || inner.ends_with(&format!(".{p}"))
+    })
+}
+
+/// Is this definition marked as test code by an attribute on itself or on any
+/// scope enclosing it?
+///
+/// Attributes are *preceding siblings* of the item they decorate in both the
+/// Rust and Python grammars, not children of it — verified against
+/// tree-sitter-rust, where `#[test] fn f()` parses as `(attribute_item)
+/// (function_item)`. Climbing parents is what catches `#[cfg(test)] mod tests`,
+/// under which plain helper functions are still test code.
+fn has_test_attribute(node: tree_sitter::Node, bytes: &[u8], patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let mut scope = Some(node);
+    while let Some(n) = scope {
+        let mut sib = n.prev_sibling();
+        while let Some(s) = sib {
+            let kind = s.kind();
+            let is_attr = kind.contains("attribute") || kind.contains("decorator");
+            // Doc comments may sit between an attribute and its item; anything
+            // else means we have left the decoration block.
+            if !is_attr && !kind.contains("comment") {
+                break;
+            }
+            if is_attr {
+                if let Ok(text) = s.utf8_text(bytes) {
+                    if attribute_names_test(text, patterns) {
+                        return true;
+                    }
+                }
+            }
+            sib = s.prev_sibling();
+        }
+        scope = n.parent();
+    }
+    false
+}
+
+/// Remove one matching pair of surrounding quotes, if present.
+fn strip_quotes(s: &str) -> &str {
+    let mut c = s.chars();
+    match (c.next(), s.chars().next_back()) {
+        (Some(a), Some(b)) if a == b && matches!(a, '"' | '\'' | '`') && s.len() >= 2 => {
+            &s[a.len_utf8()..s.len() - b.len_utf8()]
+        }
+        _ => s,
+    }
+}
+
+/// Is this path a test file?
+///
+/// Paths here are always root-relative and `/`-separated, so a repo-root
+/// `tests/` directory has no leading slash — the original `/tests/` check
+/// missed it, along with Jest's canonical `__tests__/` and vitest's
+/// `*.bench.*`. Every miss puts test code into the graph as production code.
 fn path_is_test(file: &str) -> bool {
     let f = file.to_ascii_lowercase();
-    f.contains("/tests/")
-        || f.contains("/test/")
+    let dir_named = |d: &str| f.starts_with(&format!("{d}/")) || f.contains(&format!("/{d}/"));
+    dir_named("tests")
+        || dir_named("test")
+        || dir_named("__tests__")
+        || dir_named("spec")
+        || dir_named("__mocks__")
         || f.contains("_test.")
         || f.contains(".test.")
         || f.contains(".spec.")
+        || f.contains(".bench.")
         || f.starts_with("test_")
         || f.contains("/test_")
 }
@@ -1101,6 +1503,376 @@ mod tests {
             .raw_calls
             .iter()
             .any(|c| c.caller_qualified == "m.py::compute" && c.callee_name == "helper"));
+    }
+
+    /// Rust's dominant idiom keeps tests in the same file as the code, so
+    /// neither the path nor the function name says "test". Missing them makes
+    /// every covered function look untested, and `test_gap` is 30% of risk v1.
+    #[test]
+    fn rust_test_attributes_mark_tests() {
+        let src = "fn prod() -> i32 { 1 }\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       use super::*;\n\
+                       fn helper() -> i32 { 2 }\n\
+                       #[test]\n\
+                       fn covers_prod() { assert_eq!(prod(), 1); }\n\
+                   }\n\
+                   #[tokio::test]\n\
+                   async fn covers_async() {}\n";
+        let pf = parse(&rust_config(), "src/lib.rs", src).unwrap();
+        let by = |n: &str| pf.nodes.iter().find(|x| x.name == n).cloned().unwrap();
+
+        assert!(!by("prod").is_test, "production code must stay production");
+        assert_eq!(by("prod").kind, "Function");
+
+        let t = by("covers_prod");
+        assert!(t.is_test && t.kind == "Test", "#[test] must mark a test");
+
+        let a = by("covers_async");
+        assert!(a.is_test, "#[tokio::test] is path-qualified `test`");
+
+        // A plain helper inside `#[cfg(test)] mod tests` is test code too —
+        // otherwise it shows up as an untested production function.
+        assert!(
+            by("helper").is_test,
+            "a function under #[cfg(test)] is test code"
+        );
+    }
+
+    /// A modern TS test file declares nothing: it is a list of
+    /// `test("...", () => {})` calls. Matching only declarations meant such a
+    /// file parsed to *zero* nodes, so nothing could ever be TESTED_BY, and
+    /// `test_gap` — 30% of risk v1 — was pinned at 1.0 for every symbol in the
+    /// repository.
+    #[test]
+    fn ts_test_callbacks_become_test_nodes() {
+        let src = "import { enrichProjects } from './github';\n\
+                   test(\"enriches stars from a successful fetch\", async () => {\n\
+                       await enrichProjects(base);\n\
+                   });\n\
+                   describe(\"group\", () => {\n\
+                       it(\"handles the empty case\", () => { enrichProjects([]); });\n\
+                   });\n";
+        let pf = parse(&ts_config(), "data/github.test.ts", src).unwrap();
+
+        let names: Vec<&str> = pf.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"enriches stars from a successful fetch"),
+            "got {names:?}"
+        );
+        assert!(names.contains(&"handles the empty case"), "got {names:?}");
+        assert_eq!(names.len(), 2, "one node per test case, got {names:?}");
+
+        // The path already says `.test.`, so these are Test nodes.
+        assert!(pf.nodes.iter().all(|n| n.is_test && n.kind == "Test"));
+
+        // And the call inside the callback is attributed to it, which is what
+        // makes the TESTED_BY edge derivable.
+        assert!(
+            pf.raw_calls
+                .iter()
+                .any(|c| c.callee_name == "enrichProjects"
+                    && c.caller_qualified
+                        == "data/github.test.ts::enriches stars from a successful fetch"),
+            "got {:?}",
+            pf.raw_calls
+        );
+    }
+
+    /// Test-case synthesis must not fire in ordinary source. A node minted
+    /// inside a real function takes over call attribution for that function's
+    /// byte range, so `run()`'s calls silently vanish from the graph.
+    #[test]
+    fn test_pattern_does_not_fire_in_production_files() {
+        let src = "export function run() { it(\"items\", () => { helper(); }); other(); }\n";
+        let pf = parse(&ts_config(), "src/prod.ts", src).unwrap();
+        let names: Vec<&str> = pf.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["run"], "no synthetic test node in prod code");
+        // Both calls still belong to `run`, not to a phantom `items` node.
+        for c in &pf.raw_calls {
+            assert_eq!(c.caller_qualified, "src/prod.ts::run", "{c:?}");
+        }
+    }
+
+    /// Layouts that are unmistakably tests but that the original path check
+    /// missed, putting test code into the graph as production code.
+    #[test]
+    fn test_paths_cover_common_layouts() {
+        for p in [
+            "src/__tests__/github.ts",
+            "tests/a.ts",
+            "src/parse.bench.ts",
+            "spec/thing.ts",
+            "pkg/tests/x.rs",
+            "a/b.test.ts",
+        ] {
+            assert!(path_is_test(p), "{p} should be a test path");
+        }
+        for p in [
+            "src/data/github.ts",
+            "src/latest.ts",
+            "src/contest/entry.ts",
+            "src/protests.ts",
+        ] {
+            assert!(!path_is_test(p), "{p} should NOT be a test path");
+        }
+    }
+
+    /// The grammar splits a string literal at every escape, so capturing
+    /// `string_fragment` produced one node per fragment with mangled names.
+    /// Capturing the whole `(string)`, anchored to the first argument, is one
+    /// node per test.
+    #[test]
+    fn test_names_survive_escapes_and_extra_arguments() {
+        let src = "test(\"returns \\\"ok\\\" always\", () => { go(); });\n\
+                   test(\"first\", \"second\", fn);\n";
+        let pf = parse(&ts_config(), "a.test.ts", src).unwrap();
+        assert_eq!(pf.nodes.len(), 2, "got {:?}", pf.nodes);
+        // Quotes stripped, escapes left as written in source.
+        assert_eq!(pf.nodes[0].name, "returns \\\"ok\\\" always");
+        assert_eq!(
+            pf.nodes[1].name, "first",
+            "only the first argument names it"
+        );
+    }
+
+    /// A UTF-8 BOM is not whitespace. Without stripping it the opening `---`
+    /// never matched, and a routine Windows-authored page contributed nothing
+    /// to the graph — silently, with no parse warning.
+    #[test]
+    fn astro_shim_tolerates_a_byte_order_mark() {
+        let src = "\u{feff}---\nimport { a } from './a';\nconst x = a();\n---\n<div/>\n";
+        let pf = parse(&astro_config(), "p.astro", src).unwrap();
+        assert!(
+            pf.imports.iter().any(|i| i.name == "a"),
+            "BOM must not hide the frontmatter, got {:?}",
+            pf.imports
+        );
+        assert!(pf.raw_calls.iter().any(|c| c.callee_name == "a"));
+    }
+
+    /// `---` is legal inside a template literal or block comment in
+    /// frontmatter (a page that builds Markdown). Closing the fence there
+    /// dropped the rest of the frontmatter and left an unterminated literal,
+    /// losing every symbol in the file.
+    #[test]
+    fn astro_fence_ignores_dashes_inside_strings_and_comments() {
+        let tpl = "---\nimport { render } from './md';\nconst tpl = `\n---\ntitle: hi\n---\n`;\nconst out = render(tpl);\n---\n<div/>\n";
+        let pf = parse(&astro_config(), "p.astro", tpl).unwrap();
+        assert!(
+            pf.raw_calls.iter().any(|c| c.callee_name == "render"),
+            "call after the embedded fence was lost: {:?}",
+            pf.raw_calls
+        );
+        assert!(pf.imports.iter().any(|i| i.name == "render"));
+
+        let cmt = "---\n/*\n---\n*/\nimport { z } from './z';\nconst q = z();\n---\n<div/>\n";
+        let pf = parse(&astro_config(), "c.astro", cmt).unwrap();
+        assert!(
+            pf.raw_calls.iter().any(|c| c.callee_name == "z"),
+            "call after a commented fence was lost: {:?}",
+            pf.raw_calls
+        );
+    }
+
+    /// `<script-loader>` is a different element. Matching it as `<script`
+    /// opened a block that never closed, handing the whole remaining template
+    /// to the TypeScript parser and losing the file to a parse error.
+    #[test]
+    fn astro_script_tag_name_has_a_boundary() {
+        assert!(!opens_code_script("<script-loader url=\"/x.js\">"));
+        assert!(!opens_code_script("<scriptish-thing>"));
+        assert!(opens_code_script("<script>"));
+
+        let src = "---\nconst a = 1;\n---\n<script-loader url=\"/x.js\">\n<div class=\"a\">hi &amp; bye</div>\n<p>more</p>\n";
+        let ts = astro_to_ts(src);
+        assert!(!ts.contains("<div"), "markup leaked into TS: {ts}");
+        let pf = parse(&astro_config(), "p.astro", src).unwrap();
+        assert!(
+            pf.parse_warning.is_none(),
+            "should parse cleanly, got {:?}",
+            pf.parse_warning
+        );
+    }
+
+    /// `</script >` with whitespace is legal and must close the block;
+    /// otherwise the rest of the document leaks into the TypeScript source.
+    #[test]
+    fn astro_script_close_tolerates_whitespace() {
+        assert!(closes_script("</script>"));
+        assert!(closes_script("</script >"));
+        assert!(!closes_script("</scriptfoo>"));
+
+        let src = "---\nconst a = 1;\n---\n<script>\n  boot();\n</script >\n<main>\n  <p>text</p>\n</main>\n";
+        let ts = astro_to_ts(src);
+        assert!(ts.contains("boot();"));
+        assert!(!ts.contains("<main"), "markup leaked past close: {ts}");
+    }
+
+    /// A one-line `<script>init()</script>` is real code and was being blanked
+    /// with the markup.
+    #[test]
+    fn astro_inline_script_body_is_kept() {
+        let src = "---\nconst a = 1;\n---\n<script>init();</script>\n";
+        let ts = astro_to_ts(src);
+        assert_eq!(ts.lines().count(), src.lines().count());
+        assert!(ts.contains("init();"), "got {ts}");
+        // A data one-liner is still skipped.
+        let data = "<script type=\"application/ld+json\">{\"a\":1}</script>\n";
+        assert!(!astro_to_ts(data).contains("\"a\""));
+    }
+
+    /// The shim must preserve line numbering exactly: a symbol reported on the
+    /// wrong line sends a reviewer to the wrong place.
+    #[test]
+    fn astro_shim_preserves_line_numbers() {
+        let src = "---\nimport { a } from './a';\nconst x = a();\n---\n<div>markup</div>\n<script>\n  init();\n</script>\n<style>.c{color:red}</style>\n";
+        let ts = astro_to_ts(src);
+        assert_eq!(
+            ts.lines().count(),
+            src.lines().count(),
+            "line count must be preserved"
+        );
+        let l: Vec<&str> = ts.lines().collect();
+        assert_eq!(l[0].trim(), "", "the --- fence is not TypeScript");
+        assert_eq!(l[1].trim(), "import { a } from './a';");
+        assert_eq!(l[2].trim(), "const x = a();");
+        assert_eq!(l[4].trim(), "", "markup must be blanked");
+        assert_eq!(l[6].trim(), "init();", "client script is real code");
+        assert_eq!(l[8].trim(), "", "style blocks are not TypeScript");
+    }
+
+    /// The bug this fixes: an Astro page is where the call to a helper actually
+    /// lives, and `.astro` was not in the extension table at all — so the whole
+    /// page, and every edge out of it, was missing from the graph.
+    #[test]
+    fn astro_frontmatter_yields_imports_and_calls() {
+        let src = "---\nimport { enrichProjects } from '../../data/github';\nconst enriched = await enrichProjects(projects);\n---\n<h1>{enriched.length}</h1>\n";
+        let pf = parse(&astro_config(), "pages/projects/index.astro", src).unwrap();
+
+        assert!(
+            pf.imports
+                .iter()
+                .any(|i| i.name == "enrichProjects"
+                    && i.module.as_deref() == Some("../../data/github")),
+            "the import is the resolution evidence, got {:?}",
+            pf.imports
+        );
+        // Frontmatter is all top level, so the call hangs off the file node.
+        assert!(
+            pf.raw_calls
+                .iter()
+                .any(|c| c.callee_name == "enrichProjects"
+                    && c.caller_qualified == "pages/projects/index.astro::<file>"),
+            "got {:?}",
+            pf.raw_calls
+        );
+        assert!(
+            pf.nodes.iter().any(|n| n.kind == "File"),
+            "a file node must exist for those calls to hang off"
+        );
+    }
+
+    /// A JSON-LD block opened across two lines swallowed 120 lines of markup
+    /// into the "TypeScript" it handed the parser, and the whole page was lost
+    /// to one parse error. Found on a real page, not imagined.
+    #[test]
+    fn astro_data_script_blocks_are_not_treated_as_code() {
+        assert!(opens_code_script("<script>"));
+        assert!(opens_code_script(r#"<script type="module">"#));
+        assert!(!opens_code_script(r#"<script type="application/ld+json">"#));
+        assert!(
+            !opens_code_script(
+                r#"<script is:inline type="application/ld+json" set:html={JSON.stringify({"#
+            ),
+            "an incomplete opening tag must not start a code block"
+        );
+        assert!(!opens_code_script(r#"<script src="a.js" />"#));
+        assert!(!opens_code_script("<script>init()</script>"));
+
+        // End to end: the markup after a JSON-LD block stays blanked.
+        let src = "---\nconst a = 1;\n---\n<script is:inline type=\"application/ld+json\" set:html={JSON.stringify({\n  \"@type\": \"Blog\",\n})} />\n<div>{oops()}</div>\n";
+        let ts = astro_to_ts(src);
+        assert_eq!(ts.lines().count(), src.lines().count());
+        assert!(
+            !ts.contains("@type"),
+            "JSON-LD payload must not be parsed as code: {ts}"
+        );
+        let pf = parse(&astro_config(), "p.astro", src).unwrap();
+        assert!(
+            pf.parse_warning.is_none(),
+            "should parse cleanly, got {:?}",
+            pf.parse_warning
+        );
+    }
+
+    /// An `.astro` file with no frontmatter at all is legal and must not panic
+    /// or invent nodes.
+    #[test]
+    fn astro_without_frontmatter_is_harmless() {
+        let src = "<html>\n  <body>plain markup</body>\n</html>\n";
+        let pf = parse(&astro_config(), "p.astro", src).unwrap();
+        assert!(pf.raw_calls.is_empty());
+        assert!(pf.imports.is_empty());
+    }
+
+    /// A CSS selector is not a callable. Typing it as one let stylesheets
+    /// dominate a change-risk ranking that exists to surface code.
+    #[test]
+    fn css_selectors_are_not_functions() {
+        let src = ".card { color: var(--brand); }\n\
+                   #hero { padding: 0; }\n\
+                   :root { --brand: red; }\n";
+        let pf = parse(&css_config(), "a.css", src).unwrap();
+        assert!(!pf.nodes.is_empty(), "css should still yield nodes");
+        for n in &pf.nodes {
+            assert_eq!(
+                n.kind, "Selector",
+                "css def {} must not be typed as a function",
+                n.name
+            );
+        }
+    }
+
+    /// Rust is unaffected — the default is still `Function`.
+    #[test]
+    fn rust_definitions_are_still_functions() {
+        let pf = parse(&rust_config(), "m.rs", "fn f() {}\n").unwrap();
+        assert_eq!(pf.nodes[0].kind, "Function");
+    }
+
+    /// `#[cfg(not(test))]` marks the *opposite* of a test. Substring matching on
+    /// "test" would invert it, which is why patterns match whole tokens.
+    #[test]
+    fn cfg_not_test_is_not_a_test() {
+        assert!(attribute_names_test("#[test]", &strs(&["test"])));
+        assert!(attribute_names_test("#[tokio::test]", &strs(&["test"])));
+        assert!(attribute_names_test("#[ tokio :: test ]", &strs(&["test"])));
+        assert!(attribute_names_test("#[cfg(test)]", &strs(&["cfg(test)"])));
+        assert!(!attribute_names_test(
+            "#[cfg(not(test))]",
+            &strs(&["test", "cfg(test)"])
+        ));
+        assert!(!attribute_names_test("#[derive(Debug)]", &strs(&["test"])));
+        // No patterns configured: nothing is a test by attribute.
+        assert!(!attribute_names_test("#[test]", &[]));
+    }
+
+    /// A `#[cfg(not(test))]` module must not have its contents flagged.
+    #[test]
+    fn rust_cfg_not_test_module_stays_production() {
+        let src = "#[cfg(not(test))]\n\
+                   mod prod {\n\
+                       fn only_in_release() -> i32 { 1 }\n\
+                   }\n";
+        let pf = parse(&rust_config(), "src/lib.rs", src).unwrap();
+        let n = pf
+            .nodes
+            .iter()
+            .find(|x| x.name == "only_in_release")
+            .unwrap();
+        assert!(!n.is_test, "#[cfg(not(test))] is not a test marker");
     }
 
     #[test]

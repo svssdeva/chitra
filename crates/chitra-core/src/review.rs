@@ -3,6 +3,7 @@
 
 use crate::store::Store;
 use anyhow::Result;
+use chitra_lang::Node;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use tiktoken_rs::CoreBPE;
@@ -38,12 +39,33 @@ pub fn estimate_files(paths: &[String]) -> Result<usize> {
 
 // ---- risk v1 (structural signals only; flow/community/security are v2/Phase 3) ----
 
+/// Can a definition of this kind have tests at all?
+///
+/// Styling, markup anchors, and whole-file nodes cannot, so a missing test is
+/// not evidence of risk for them — it is a category error.
+///
+/// `File` matters as much as `Selector` here. A `<file>` node exists so that
+/// code written outside any function (an Astro page's frontmatter, HTML
+/// markup) has somewhere to hang, and nothing ever *calls* a page — its fan-in
+/// is 0 by construction. Charged a test gap, every such node scored a flat
+/// 0.30, so a diff touching N pages put N identically-scored nodes into the
+/// top of the ranking, broken only by an alphabetical tie-break. That is the
+/// same failure this rule exists to prevent, one kind over.
+fn is_testable(kind: &str) -> bool {
+    !matches!(kind, "Selector" | "Anchor" | "File")
+}
+
 #[derive(Debug, Clone)]
 pub struct Risk {
     pub score: f64, // 0..1
     pub fan_in: i64,
     pub has_tests: bool,
     pub ambiguous_density: f64,
+    /// Whether the test-gap term applied at all. Without this the printed
+    /// terms do not add up to the printed score — `has_tests=false` with the
+    /// term silently suppressed made `risk` un-hand-checkable, which is the
+    /// one property the v1 formula was chosen for.
+    pub test_gap_applies: bool,
 }
 
 /// Aggregates loaded once, then reused across every node (avoids N*queries).
@@ -64,11 +86,21 @@ impl RiskMaps {
 
     /// Additive risk v1: 0.5·fan-in + 0.3·test-gap + 0.2·ambiguous-density.
     /// Each term is in [0,1], weights sum to 1 → score in [0,1]. Hand-calcable.
-    pub fn risk_of(&self, qn: &str, is_test: bool) -> Risk {
+    ///
+    /// `test_gap` only counts against something that *could* have been tested.
+    /// A CSS selector cannot, so charging it the full 0.3 was an unearnable
+    /// penalty: on a real site every stylesheet scored ~0.85 and the top 20
+    /// changed symbols were all selectors, while the changed page and handler
+    /// code they were supposed to surface never appeared.
+    pub fn risk_of(&self, qn: &str, node: &Node) -> Risk {
         let fan_in = self.fan_in.get(qn).copied().unwrap_or(0);
         let fan_in_norm = fan_in.min(10) as f64 / 10.0; // ≥10 callers = maximal centrality
         let has_tests = self.tested.contains(qn);
-        let test_gap = if is_test || has_tests { 0.0 } else { 1.0 };
+        let test_gap = if node.is_test || has_tests || !is_testable(&node.kind) {
+            0.0
+        } else {
+            1.0
+        };
         let (amb, total) = self.amb.get(qn).copied().unwrap_or((0, 0));
         let ambiguous_density = if total > 0 {
             amb as f64 / total as f64
@@ -81,6 +113,7 @@ impl RiskMaps {
             fan_in,
             has_tests,
             ambiguous_density,
+            test_gap_applies: is_testable(&node.kind),
         }
     }
 }
@@ -91,7 +124,7 @@ pub fn risk(store: &Store, sym: &str) -> Result<Option<Risk>> {
         return Ok(None);
     };
     let maps = RiskMaps::load(store)?;
-    Ok(Some(maps.risk_of(sym, node.is_test)))
+    Ok(Some(maps.risk_of(sym, &node)))
 }
 
 // ---- risk v2 (Phase 3: folds in flow / community / security terms) ----
@@ -171,9 +204,10 @@ pub fn risk_v2(store: &Store, sym: &str) -> Result<Option<RiskV2>> {
         return Ok(None);
     };
     let maps = RiskMaps::load(store)?;
-    let base = maps.risk_of(sym, node.is_test);
+    let base = maps.risk_of(sym, &node);
     let fan_in_norm = base.fan_in.min(10) as f64 / 10.0;
-    let test_gap = if node.is_test || base.has_tests {
+    // Same rule as v1: an untestable kind is not charged for missing tests.
+    let test_gap = if node.is_test || base.has_tests || !is_testable(&node.kind) {
         0.0
     } else {
         1.0
@@ -215,7 +249,7 @@ pub fn top_risks(store: &Store, n: usize) -> Result<Vec<(String, Risk)>> {
         .load_nodes()?
         .into_iter()
         .map(|node| {
-            let r = maps.risk_of(&node.qualified_name, node.is_test);
+            let r = maps.risk_of(&node.qualified_name, &node);
             (node.qualified_name, r)
         })
         .collect();
@@ -284,7 +318,7 @@ pub fn review_context(store: &Store, sym: &str, detail: Detail) -> Result<Value>
         return Ok(json!({"error": format!("no such symbol: {sym}")}));
     };
     let maps = RiskMaps::load(store)?;
-    let r = maps.risk_of(sym, node.is_test);
+    let r = maps.risk_of(sym, &node);
     let cap = detail.cap();
     let mut callers = store.callers_of(sym)?;
     let caller_total = callers.len();
@@ -346,7 +380,7 @@ pub fn detect_changes(
     let mut high = 0;
     for f in &changed {
         for node in store.nodes_in_file(f)? {
-            let r = maps.risk_of(&node.qualified_name, node.is_test);
+            let r = maps.risk_of(&node.qualified_name, &node);
             if r.score >= 0.70 {
                 high += 1;
             }
@@ -484,6 +518,120 @@ mod tests {
         // hot outranks cold.
         let top = top_risks(&store, 3).unwrap();
         assert_eq!(top[0].0, "core.rs::hot");
+    }
+
+    /// A CSS selector cannot be tested, so the 0.3 test-gap term is not
+    /// evidence about it. Charging it anyway put stylesheets above code in the
+    /// change ranking — on a real site, all 20 top-ranked changed symbols were
+    /// selectors while the changed handlers never surfaced.
+    #[test]
+    fn untestable_kinds_are_not_charged_a_test_gap() {
+        let dir = std::env::temp_dir().join("chitra_risk_kind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One CSS class referenced from two HTML files, and one untested fn
+        // with the same fan-in, so only the kind differs.
+        std::fs::write(dir.join("a.css"), ".card { color: red; }\n").unwrap();
+        std::fs::write(dir.join("one.html"), "<div class=\"card\"></div>\n").unwrap();
+        std::fs::write(dir.join("two.html"), "<p class=\"card\"></p>\n").unwrap();
+        std::fs::write(
+            dir.join("m.rs"),
+            "fn target() {}\nfn a() { target(); }\nfn b() { target(); }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        crate::build(&mut store, Path::new(&dir)).unwrap();
+
+        let sel = risk(&store, "a.css::card").unwrap().unwrap();
+        let func = risk(&store, "m.rs::target").unwrap().unwrap();
+        assert_eq!(sel.fan_in, func.fan_in, "fan-in must match for a fair test");
+
+        // Selector: 0.5*0.2 + 0.3*0 (not testable) = 0.10
+        assert!((sel.score - 0.10).abs() < 1e-9, "selector {}", sel.score);
+        // Function: 0.5*0.2 + 0.3*1 (untested) = 0.40
+        assert!((func.score - 0.40).abs() < 1e-9, "function {}", func.score);
+        assert!(
+            func.score > sel.score,
+            "untested code must outrank equally-referenced styling"
+        );
+    }
+
+    /// Nothing calls a page, so a `<file>` node's fan-in is 0 by construction.
+    /// Charged a test gap it scored a flat 0.30, and a diff touching N pages
+    /// put N identically-scored nodes at the top of the ranking — the very
+    /// failure the untestable-kind rule exists to prevent.
+    #[test]
+    fn file_nodes_are_not_charged_a_test_gap() {
+        let dir = std::env::temp_dir().join("chitra_risk_filekind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.css"), ".card { color: red; }\n").unwrap();
+        for i in 0..3 {
+            std::fs::write(
+                dir.join(format!("p{i}.html")),
+                "<div class=\"card\"></div>\n",
+            )
+            .unwrap();
+        }
+        // One genuinely risky thing: untested code with real fan-in.
+        std::fs::write(
+            dir.join("m.rs"),
+            "fn target() {}\nfn a() { target(); }\nfn b() { target(); }\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        crate::build(&mut store, Path::new(&dir)).unwrap();
+
+        for i in 0..3 {
+            let f = risk(&store, &format!("p{i}.html::<file>"))
+                .unwrap()
+                .unwrap();
+            assert!(
+                (f.score - 0.0).abs() < 1e-9,
+                "markup file node scored {}",
+                f.score
+            );
+            assert!(!f.test_gap_applies);
+        }
+        // The untested function is what the ranking should surface.
+        let top = top_risks(&store, 3).unwrap();
+        assert_eq!(top[0].0, "m.rs::target", "got {top:?}");
+    }
+
+    /// If the printed terms cannot reconstruct the printed score, the formula
+    /// is no longer hand-checkable — the property it was chosen for.
+    #[test]
+    fn risk_reports_whether_the_test_gap_applied() {
+        let dir = std::env::temp_dir().join("chitra_risk_reports");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.css"), ".card { color: red; }\n").unwrap();
+        std::fs::write(dir.join("one.html"), "<div class=\"card\"></div>\n").unwrap();
+        std::fs::write(dir.join("m.rs"), "fn t() {}\nfn a() { t(); }\n").unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        crate::build(&mut store, Path::new(&dir)).unwrap();
+
+        let sel = risk(&store, "a.css::card").unwrap().unwrap();
+        assert!(!sel.test_gap_applies, "a selector cannot be tested");
+        let fun = risk(&store, "m.rs::t").unwrap().unwrap();
+        assert!(fun.test_gap_applies, "a function can be");
+
+        // With the flag, both scores reconstruct from the printed terms.
+        let recompute = |r: &Risk| {
+            0.5 * (r.fan_in.min(10) as f64 / 10.0)
+                + 0.3
+                    * if r.test_gap_applies && !r.has_tests {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                + 0.2 * r.ambiguous_density
+        };
+        assert!((recompute(&sel) - sel.score).abs() < 1e-9);
+        assert!((recompute(&fun) - fun.score).abs() < 1e-9);
     }
 
     #[test]
